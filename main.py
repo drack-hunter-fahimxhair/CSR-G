@@ -96,7 +96,7 @@ AUTO_MOVE_DEFAULT_RTT     = 120
 # ★ CUSTOM MOVEMENT CYCLE CONFIG ★
 CUSTOM_CYCLE_ENABLED      = True
 CUSTOM_CYCLE_STEPS        = [
-    ("run_1",         0.5),   # ০.৫ সেকেন্ড সোজা দৌড়াবে
+    ("run_1",         5.0),   # ০.৫ সেকেন্ড সোজা দৌড়াবে
     ("crouch_walk",   0.8),   # ০.৮ সেকেন্ড বসে সামনের দিকে হাঁটবে
     ("run_2",         0.5),   # ০.৫ সেকেন্ড আবার দৌড়াবে
     ("rotate_screen", 0.6),   # ০.৬ সেকেন্ড স্ক্রিন ঘোরাবে
@@ -2090,13 +2090,22 @@ def _extract_key_iv(res_json):
 async def aes_encrypt(payload, key, iv):
     return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(payload, AES.block_size))
 
-# ==================== VERSION / LOGIN ====================
+_APP_VER_CACHE = {"ver": None, "ts": 0.0}
+
 def get_app_version():
-    try: return play_scraper('com.dts.freefireth').get('version')
-    except Exception: return "1.132.9"
+    now = time.time()
+    if _APP_VER_CACHE["ver"] and (now - _APP_VER_CACHE["ts"]) < 3600:
+        return _APP_VER_CACHE["ver"]
+    try:
+        v = play_scraper('com.dts.freefireth').get('version') or "1.132.9"
+        _APP_VER_CACHE["ver"] = v
+        _APP_VER_CACHE["ts"] = now
+        return v
+    except Exception:
+        return _APP_VER_CACHE["ver"] or "1.132.9"
 
 async def version_config(region="ID"):
-    app_version = get_app_version()
+    app_version = await asyncio.to_thread(get_app_version)
     lang = REGION_LANG.get(region.upper(), "en")
     url = (f"https://version.ggwhitehawk.com/live/ver.php?version={app_version}"
            f"&lang={lang}&device=android&channel=android&appstore=googleplay"
@@ -3170,6 +3179,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         try: bot_state.update_status(uid_str, "ONLINE" if remaining == 0 else "IN_MATCH", remaining)
         except Exception: pass
 
+_SQUAD_MATCH_ENDED_AT: Dict[str, float] = {}
 
 # ==================== PLAY GAME (CS MODE) ====================
 async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
@@ -3203,6 +3213,7 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
         ping_task = asyncio.create_task(keepalive_ping(sock, resolved_ip, port, udp_key_bytes, match_code,
                                                        ping_stop, move_state))
         last_activity = time.time()
+        last_game_activity = time.time()
         ack_top, ack_sent_at = None, 0.0
         blind_acks = 0
         print_premium(f"{tag} UDP session → {resolved_ip}:{port}", color=PX.CYAN, icon=I["target"])
@@ -3219,7 +3230,7 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
         force_move_task = asyncio.create_task(force_move_after_delay())
 
         async def send_thunder_sharma():
-            nonlocal ack_state, thunder_sent, move_task, skill_task
+            nonlocal ack_state, thunder_sent, move_task, skill_task, last_game_activity
             if thunder_sent: return
             async with send_lock:
                 if thunder_sent: return
@@ -3234,6 +3245,7 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
                     await asyncio.sleep(0.2)
                     await loop.sock_sendto(sock, bytes.fromhex(sharma), (resolved_ip, port))
                     ack_state = "thunder_sharma_sent"
+                    last_game_activity = time.time()
                     print_premium(f"{tag} Thunder ({len(thunder)} parts) + Sharma sent → Playing CS!",
                                   color=PX.LIME, icon=I["flame"])
                     if AUTO_MOVE_ENABLED and move_task is None:
@@ -3249,8 +3261,16 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
                     print_error(f"{tag} startup: {e}")
 
         while not local_closed:
-            if time.time() - match_start_time > CS_MAX_MATCH_DURATION:
+            now = time.time()
+            if now - match_start_time > CS_MAX_MATCH_DURATION:
                 completed_cleanly = True; break
+
+            # স্কোয়াডের অন্য বট ম্যাচ শেষের সিগন্যাল (103/107) পেলে এই বটও ৬ সেকেন্ড পর বের হবে
+            squad_end = _SQUAD_MATCH_ENDED_AT.get(move_state.squad_id, 0.0)
+            if squad_end > match_start_time + 15.0 and (now - squad_end) > 6.0:
+                print_success(f"{tag} synced match end with squad {move_state.squad_id}")
+                completed_cleanly = True; break
+
             try:
                 response, server_addr = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=1.5)
                 if response:
@@ -3278,8 +3298,11 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
                         cmd = frame.get('cmd')
                         order_id = frame.get('orderId')
                         flags = frame.get('flags', 0)
+                        if cmd != 3:
+                            last_game_activity = time.time()
                         if cmd in [103, 107]:
                             print_premium(f"{tag} END (cmd {cmd})", color=PX.MAGENTA, icon=I["star"])
+                            _SQUAD_MATCH_ENDED_AT[move_state.squad_id] = time.time()
                             completed_cleanly = True; local_closed = True
                             continue
                         if cmd == 130:
@@ -3312,19 +3335,20 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
                             _, reply = await reply_for(frame, udp_key_bytes, match_code)
                             if reply: await loop.sock_sendto(sock, reply, server_addr)
             except asyncio.TimeoutError:
+                now = time.time()
                 if ack_state == "ready_to_send_thunder" and not thunder_sent:
                     await send_thunder_sharma()
                 elif ack_state == "waiting_for_hello_reply":
-                    if (time.time() - last_activity) > 7.0:
+                    if (now - last_activity) > 7.0:
                         try:
                             pkt = await build_cs_hello_packet(f"{account_id}_2585", udp_key_bytes, match_code)
                             await loop.sock_sendto(sock, bytes.fromhex(pkt), (resolved_ip, port))
                         except Exception: pass
                         last_activity = time.time()
-                    if (time.time() - match_start_time) > 25.0:
+                    if (now - match_start_time) > 25.0:
                         print_warning(f"{tag} Handshake timeout"); break
                 elif ack_state == "thunder_sharma_sent":
-                    if (time.time() - last_activity) > CS_MATCH_IDLE_TIMEOUT:
+                    if (now - last_activity) > CS_MATCH_IDLE_TIMEOUT or (now - last_game_activity) > (CS_MATCH_IDLE_TIMEOUT + 8.0):
                         print_success(f"{tag} finished naturally (server silent)")
                         completed_cleanly = True; break
                 continue
@@ -3373,7 +3397,7 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
 
 # ==================== FUNCTIONAL LONE WOLF ====================
 async def functional_lone_wolf(addrs, starter_packet, account_region, client_version,
-                                key, iv, account_id="", account_data=None, max_reconnects=10,
+                                key, iv, account_id="", account_data=None, max_reconnects=3,
                                 squad_id="A"):
     reconnects = 0
     ip, port = addrs.split(":")
@@ -3484,18 +3508,24 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
     async def _team_coordinator():
         try:
-            while True:
+            peers_snapshot = {}
+            while _team_active["flag"] and not _match_played["flag"]:
+                if bot_state.is_paused(uid_str): return
                 async with team_state["lock"]:
                     n = len(team_state["peers"])
-                if n >= TEAM_SIZE: break
-                if bot_state.is_paused(uid_str): return
+                    if team_state["leader_uid"] is None and team_state["peers"]:
+                        team_state["leader_uid"] = next(iter(team_state["peers"]))
+                    is_leader = (team_state["leader_uid"] == uid_str)
+                if n >= TEAM_SIZE and is_leader:
+                    await asyncio.sleep(TEAM_READY_DELAY)
+                    async with team_state["lock"]:
+                        is_leader = (team_state["leader_uid"] == uid_str)
+                        peers_snapshot = dict(team_state["peers"])
+                    if is_leader and len(peers_snapshot) >= TEAM_SIZE:
+                        break
                 await asyncio.sleep(0.5)
-            await asyncio.sleep(TEAM_READY_DELAY)
-            async with team_state["lock"]:
-                is_leader = (team_state["leader_uid"] == uid_str)
-                peers_snapshot = dict(team_state["peers"])
-            if not is_leader:
-                print_info(f"TEAM[{gid}] {uid_str} waiting as member..."); return
+            else:
+                return
             print_premium(f"TEAM[{gid}] {uid_str} — creating {'CS' if CS_MODE_ENABLED else 'BR'} squad region={account_region}",
                           color=PX.GOLD, icon=I["crown"])
             async with team_state["lock"]:
@@ -3893,7 +3923,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 async with team_state["lock"]:
                     team_state["peers"].pop(uid_str, None)
                     if team_state["leader_uid"] == uid_str:
-                        team_state["leader_uid"] = None
+                        team_state["leader_uid"] = next(iter(team_state["peers"]), None)
                         team_state["team_code"] = None
                 try: await _clear_team_joined(uid_str)
                 except Exception: pass
@@ -4165,7 +4195,7 @@ async def account_loop_guest(uid, password, region_override=None, clan_override=
             if acc_id: bot_state.update_status(acc_id, "CONNECTING")
             ad = await process_account_uid_pass(uid_str, password, region_override, squad_id=squad)
             if not ad:
-                print_error(f"Login failed {uid_str}. Retry 15s"); await asyncio.sleep(15); continue
+                print_error(f"Login failed {uid_str}. Retry 5s"); await asyncio.sleep(5); continue
             ad['squad_id'] = squad
             acc_id = str(ad['account_id'])
             if acc_id in bot_state.accounts:
@@ -4180,11 +4210,13 @@ async def account_loop_guest(uid, password, region_override=None, clan_override=
             )
             setup_done = True
 
-            # ম্যাচ শেষ → এই বট অফলাইন হবে, তারপর অনলাইন হয়ে নিজের গ্রুপে জয়েন করবে
+            # ম্যাচ শেষ → পুরনো সেশন/টোকেন ক্যাশ মুছে ফ্রেশ লগইনের জন্য OFFLINE
+            cache_invalidate(uid_str)
             bot_state.update_status(acc_id, "OFFLINE")
             bot_state.update_status(uid_str, "OFFLINE")
-            print_warning(f"[{acc_id}][{squad}] OFFLINE for {REJOIN_OFFLINE_DELAY:.0f}s before next match...")
-            await asyncio.sleep(REJOIN_OFFLINE_DELAY)
+            rejoin_wait = REJOIN_OFFLINE_DELAY + random.uniform(1.0, 3.0)
+            print_warning(f"[{acc_id}][{squad}] OFFLINE for {rejoin_wait:.1f}s before next match...")
+            await asyncio.sleep(rejoin_wait)
         except asyncio.CancelledError:
             try:
                 bot_state.update_status(uid_str, "OFFLINE")
@@ -4196,7 +4228,7 @@ async def account_loop_guest(uid, password, region_override=None, clan_override=
             except Exception: pass
             break
         except Exception as e:
-            print_error(f"err {uid_str}: {e}"); await asyncio.sleep(10)
+            print_error(f"err {uid_str}: {e}"); await asyncio.sleep(5)
 
 # ==================== CREATE ACCOUNTS ====================
 def _gf_field(ld, key, default=None):
