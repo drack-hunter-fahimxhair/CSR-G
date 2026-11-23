@@ -412,20 +412,51 @@ body.c-down .c-ring{width:24px;height:24px;background:color-mix(in srgb,var(--em
 .seg button.active{color:var(--bg);background:var(--grad-2);box-shadow:0 6px 18px color-mix(in srgb,var(--gold) 35%,transparent),inset 0 1px 0 rgba(255,255,255,.3)}
 .seg .n{font-style:normal;font-family:'JetBrains Mono',monospace;font-size:10.5px;padding:1px 7px;border-radius:6px;background:rgba(0,0,0,.25)}
 
-/* Accounts grid */
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,350px),1fr));gap:16px;transition:all .3s ease}
-.grid.compact{grid-template-columns:repeat(auto-fill,minmax(min(100%,260px),1fr));gap:10px}
-.grid.compact .node{padding:14px}
-.grid.compact .metrics{gap:5px}
-.grid.compact .metric{padding:8px}
-.grid.compact .metric span{font-size:9.5px}
-.grid.compact .metric strong{font-size:11px}
-.grid.compact .ava{width:52px;height:52px}
-.grid.compact .ava-in{width:40px;height:40px;font-size:15px}
-.grid.compact .name{font-size:13px}
-.grid.compact .node-foot{margin-top:12px;padding-top:10px}
-.grid.compact .prog-top{font-size:10px}
-.grid.compact .prog-bot{font-size:10px;margin-top:5px}
+/* ============================================================
+   ACCOUNTS — GROUPED BY SQUAD (Group A, B, C, D…)
+   ============================================================ */
+.group-section{margin-bottom:28px;animation:pageIn .4s cubic-bezier(.22,.9,.28,1.2)}
+.group-section[hidden]{display:none!important}
+.group-head{
+  display:flex;align-items:center;gap:12px;
+  padding:10px 18px;margin-bottom:14px;border-radius:12px;
+  background:linear-gradient(135deg,color-mix(in srgb,var(--gold) 10%,transparent),color-mix(in srgb,var(--emerald) 6%,transparent));
+  border:1px solid var(--border-2);position:relative;overflow:hidden;
+}
+.group-head::before{content:'';position:absolute;inset-inline-start:0;top:0;bottom:0;width:3px;background:var(--grad-2)}
+.group-badge{
+  display:flex;align-items:center;justify-content:center;
+  width:38px;height:38px;border-radius:11px;
+  background:var(--grad-2);color:var(--bg);
+  font-weight:900;font-size:16px;font-family:'Space Grotesk',sans-serif;
+  box-shadow:0 6px 20px color-mix(in srgb,var(--gold) 35%,transparent);
+  flex-shrink:0;
+}
+.group-title{font-weight:900;font-size:15px;letter-spacing:.5px;background:var(--grad-2);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;line-height:1.1}
+.group-sub{color:var(--text-dim);font-size:11px;font-weight:700;font-family:'JetBrains Mono',monospace;margin-top:1px}
+.group-count{
+  margin-inline-start:auto;padding:4px 12px;border-radius:8px;
+  background:color-mix(in srgb,var(--emerald) 12%,transparent);
+  border:1px solid color-mix(in srgb,var(--emerald) 35%,transparent);
+  color:var(--emerald);font-size:11px;font-weight:800;
+  font-family:'JetBrains Mono',monospace;white-space:nowrap;
+}
+.group-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,350px),1fr));gap:16px;transition:all .3s ease}
+
+/* Compact mode (applied on #accounts) */
+#accounts.compact .group-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,260px),1fr));gap:10px}
+#accounts.compact .node{padding:14px}
+#accounts.compact .metrics{gap:5px}
+#accounts.compact .metric{padding:8px}
+#accounts.compact .metric span{font-size:9.5px}
+#accounts.compact .metric strong{font-size:11px}
+#accounts.compact .ava{width:52px;height:52px}
+#accounts.compact .ava-in{width:40px;height:40px;font-size:15px}
+#accounts.compact .name{font-size:13px}
+#accounts.compact .node-foot{margin-top:12px;padding-top:10px}
+#accounts.compact .prog-top{font-size:10px}
+#accounts.compact .prog-bot{font-size:10px;margin-top:5px}
+
 .node{padding:20px;position:relative;transition:transform var(--ease),box-shadow var(--ease);animation:cardIn .5s cubic-bezier(.22,.9,.28,1.2) both}
 @keyframes cardIn{from{opacity:0;transform:translateY(15px) scale(.96)}}
 .node:hover{transform:translateY(-4px);box-shadow:0 15px 50px color-mix(in srgb,var(--gold) 15%,transparent)}
@@ -473,7 +504,7 @@ body.c-down .c-ring{width:24px;height:24px;background:color-mix(in srgb,var(--em
 .act{width:36px;height:36px;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,.02);color:var(--text-dim);display:grid;place-items:center;font-size:12.5px;transition:var(--ease)}
 .act:hover{color:var(--text);border-color:var(--gold);background:color-mix(in srgb,var(--gold) 15%,transparent);transform:translateY(-2px);box-shadow:0 6px 16px color-mix(in srgb,var(--gold) 20%,transparent)}
 .act.danger:hover{color:var(--error);border-color:var(--error);background:color-mix(in srgb,var(--error) 12%,transparent);box-shadow:0 6px 16px color-mix(in srgb,var(--error) 25%,transparent)}
-.empty{grid-column:1/-1;text-align:center;padding:60px 16px;color:var(--text-dim);font-weight:700}
+.empty{text-align:center;padding:60px 16px;color:var(--text-dim);font-weight:700}
 .empty i.big{display:block;font-size:38px;margin-bottom:16px;color:var(--gold);filter:drop-shadow(0 0 20px color-mix(in srgb,var(--gold) 40%,transparent));animation:floatIcon 3s ease-in-out infinite}
 @keyframes floatIcon{50%{transform:translateY(-8px)}}
 .empty .btn{margin:18px 5px 0}
@@ -766,7 +797,7 @@ body.c-down .c-ring{width:24px;height:24px;background:color-mix(in srgb,var(--em
       <!-- PAGE: TARGETS -->
       <section id="page-targets" class="page">
         <div class="page-head">
-          <div><h1 class="page-title" data-text="Accounts">Accounts</h1><p class="page-sub">Manage connected accounts</p></div>
+          <div><h1 class="page-title" data-text="Accounts">Accounts</h1><p class="page-sub">Manage connected accounts · grouped by squad</p></div>
           <div class="row">
             <button class="btn" id="btnPauseAll"><i class="fa-solid fa-pause"></i><span>Pause All</span></button>
             <button class="btn ok" data-open="teamModal"><i class="fa-solid fa-users-gear"></i>Create Team</button>
@@ -783,7 +814,7 @@ body.c-down .c-ring{width:24px;height:24px;background:color-mix(in srgb,var(--em
             <button data-f="paused">Paused<em class="n" id="f-paused">0</em></button>
           </div>
         </div>
-        <div class="grid" id="accounts">
+        <div id="accounts">
           <div class="empty" id="connecting"><i class="fa-solid fa-circle-notch fa-spin big"></i>Connecting to server...</div>
         </div>
         <div class="empty" id="noMatch" hidden><i class="fa-solid fa-filter-circle-xmark big"></i>No matching accounts.</div>
@@ -864,13 +895,13 @@ body.c-down .c-ring{width:24px;height:24px;background:color-mix(in srgb,var(--em
   <div class="sheet">
     <h2>Create Team</h2>
     <form id="teamForm" novalidate>
-      <p class="lead">New guest accounts are created, joined to the clan, and start a team match together.</p>
+      <p class="lead">New guest accounts are created, joined to the clan, and start a team match together. Every 4 bots = one squad group (A, B, C…).</p>
       <div class="two">
         <div class="field"><label for="teamRegion">Region</label><select id="teamRegion"><option value="BD">BD — Bangladesh</option><option value="IND">IND — India</option><option value="ID">ID — Indonesia</option><option value="ME">ME — Middle East</option><option value="PK">PK — Pakistan</option><option value="VN">VN — Vietnam</option><option value="TH">TH — Thailand</option><option value="TW">TW — Taiwan</option><option value="RU">RU — Russia</option><option value="SAC">SAC — South America</option><option value="BR">BR — Brazil</option><option value="NA">NA — North America</option><option value="SG">SG — Singapore</option><option value="US">US — United States</option></select></div>
         <div class="field"><label for="teamClan">Clan ID</label><input id="teamClan" type="text" inputmode="numeric" value="3087207343"></div>
       </div>
       <div class="two">
-        <div class="field"><label for="teamCount">Number of Bots</label><select id="teamCount"><option value="4" selected>4 bots (full team)</option><option value="3">3 bots</option><option value="2">2 bots</option></select></div>
+        <div class="field"><label for="teamCount">Number of Bots</label><select id="teamCount"><option value="4" selected>4 bots (Group A)</option><option value="8">8 bots (Group A + B)</option><option value="12">12 bots (Group A + B + C)</option><option value="3">3 bots</option><option value="2">2 bots</option></select></div>
         <div class="field"><label for="teamPass">Password</label><input id="teamPass" type="text" value="MAHIR"></div>
       </div>
       <div class="card-actions"><button type="button" class="btn" data-close="teamModal">Cancel</button><button type="submit" class="btn ok" id="teamSubmit"><i class="fa-solid fa-bolt"></i>Create &amp; Start</button></div>
@@ -914,6 +945,7 @@ const MUSIC_KEY = "MAHIR_GLORY_music_v4";
 const COMPACT_KEY = "MAHIR_GLORY_compact_v4";
 const THEME_KEY = "MAHIR_GLORY_theme_v4";
 const THEMES = ["midas", "cyber", "flame", "ocean", "royal", "sunset"];
+const TEAM_SIZE = 4; // matches backend TEAM_SIZE
 
 /* ============ EXP TABLE ============ */
 const EXP_TABLE = {1:0,2:48,3:202,4:544,5:1012,6:1844,7:2792,8:3800,9:4870,10:6004,11:7192,12:8448,13:9760,14:11140,15:12566,16:14060,17:15610,18:17224,19:18902,20:20632,21:22424,22:24278,23:26192,24:28166,25:30200,26:32294,27:34448,28:37804,29:41274,30:44870,31:48582,32:53394,33:58566,34:64096,35:69994,36:76460,37:83506,38:91128,39:99322,40:108092,41:120144,42:133266,43:147472,44:162760,45:179126,46:196572,47:215368,48:235516,49:257010,50:279860,51:304056,52:348318,53:394982,54:444044,55:495508,56:549364,57:633756,58:721744,59:813336,60:908522,61:1041438,62:1180352,63:1325266,64:1476184,65:1634300,66:1840946,67:2056594,68:2281242,69:2514880,70:2757530,71:3059506,72:3372284,73:3699456,74:4041030,75:4397002,76:4829104,77:5282204,78:5756304,79:6251408,80:6776502,81:7381324,82:8043154,83:8752982,84:9510808,85:10316338,86:11277190,87:12291748,88:13360304,89:14482858,90:15659418,91:17026708,92:18453950,93:19941280,94:21488570,95:23095858,96:24763138,97:26490428,98:28378704,99:30124996,100:32032884};
@@ -1215,6 +1247,20 @@ function doLogout() {
   soundClick();
   showEntry();
 }
+
+/* ── WELCOME MESSAGE ── */
+function showWelcome() {
+  setTimeout(() => {
+    toast("HEY DEAR • WOLLCOME TO MAHIR WORLD 👑", "success");
+    addNotification(
+      "Welcome",
+      "HEY DEAR WOLLCOME TO MAHIR WORLD",
+      "success",
+      () => go("core")
+    );
+  }, 700);
+}
+
 $("loginForm").addEventListener("submit", e => {
   e.preventDefault();
   const val = $("passwordInput").value;
@@ -1226,6 +1272,7 @@ $("loginForm").addEventListener("submit", e => {
     hideEntry();
     if (musicEnabled) startMusic();
     init();
+    showWelcome();
   } else {
     $("loginError").textContent = "Incorrect password, try again";
     $("passwordInput").value = "";
@@ -1263,6 +1310,10 @@ function addNotification(title, message, type = "info", action = null) {
   saveNotifs();
   updateNotifCount();
   renderNotifs();
+}
+function nowTime() {
+  const d = new Date();
+  return d.toLocaleTimeString("en-GB", { hour12: false });
 }
 function updateNotifCount() {
   const unread = state.notifications.filter(n => !n.read).length;
@@ -1427,8 +1478,10 @@ $("teamForm").addEventListener("submit", e => {
       const d = await post("/api/create_team", { region, clan_id, count, password });
       if (d.ok) {
         closeModal("teamModal");
-        toast(`Creating ${count} bots in ${region}...`, "success");
-        addNotification("Create Team", `${count} new bots in ${region}`, "success");
+        const squads = Math.ceil(count / TEAM_SIZE);
+        const squadNames = Array.from({length: squads}, (_, i) => String.fromCharCode(65 + i)).join(", ");
+        toast(`Creating ${count} bots in Group ${squadNames} (${region})...`, "success");
+        addNotification("Create Team", `${count} new bots in ${region} · Groups ${squadNames}`, "success");
         [3000, 8000, 15000].forEach(ms => setTimeout(fetchStats, ms));
       } else {
         toast(d.error || "Failed to create team", "error");
@@ -1551,44 +1604,122 @@ function renderDist(cats) {
   Object.keys(n).forEach(k => $("d-" + k).textContent = n[k]);
   $("distBar").innerHTML = cats.length ? Object.keys(n).filter(k => n[k]).map(k => `<i class="c-${k}" style="width:${(n[k] / cats.length * 100).toFixed(2)}%"></i>`).join("") : "";
 }
+
+/* ── RENDER GROUPED ACCOUNTS ── */
 function renderAccounts(accounts, force) {
-  const box = $("accounts"), cats = accounts.map(nodeCategory);
-  $("btnPauseAll").innerHTML = accounts.length && cats.every(c => c === "paused") ? '<i class="fa-solid fa-play"></i><span>Resume All</span>' : '<i class="fa-solid fa-pause"></i><span>Pause All</span>';
+  const box = $("accounts");
+  const cats = accounts.map(nodeCategory);
+
+  $("btnPauseAll").innerHTML = accounts.length && cats.every(c => c === "paused")
+    ? '<i class="fa-solid fa-play"></i><span>Resume All</span>'
+    : '<i class="fa-solid fa-pause"></i><span>Pause All</span>';
+
   const n = { all: accounts.length, in_match: 0, online: 0, paused: 0 };
   cats.forEach(c => { if (c === "match") { n.in_match++; n.online++; } else if (c === "online" || c === "search") n.online++; else if (c === "paused") n.paused++; });
   Object.keys(n).forEach(k => $("f-" + k).textContent = n[k]);
   renderDist(cats);
+
   const cn = $("connecting"); if (cn) cn.remove();
+
+  /* Empty state */
   if (!accounts.length) {
-    box.querySelectorAll(".node").forEach(c => c.remove());
-    let e = box.querySelector(".empty");
-    if (!e) { e = document.createElement("div"); e.className = "empty"; box.appendChild(e); }
-    e.innerHTML = emptyHTML(); $("noMatch").hidden = true; return;
+    box.innerHTML = '<div class="empty">' + emptyHTML() + '</div>';
+    $("noMatch").hidden = true;
+    return;
   }
+
   box.querySelectorAll(".empty").forEach(e => e.remove());
-  const uids = new Set(accounts.map(a => String(a.uid)));
-  box.querySelectorAll(".node").forEach(c => { if (!uids.has(c.dataset.uid)) c.remove(); });
+
+  /* Group accounts by squad_id (A, B, C, D, …) */
+  const groups = {};
   accounts.forEach((acc, idx) => {
-    const uid = String(acc.uid), cat = cats[idx];
-    const level = Math.min(100, Math.max(1, parseInt(acc.level) || 1)), isMax = level >= 100, nextLvl = Math.min(100, level + 1);
-    const baseExp = EXP_TABLE[level] ?? 0, target = EXP_TABLE[nextLvl] ?? baseExp + 50000;
-    const needed = Math.max(1, target - baseExp), curExp = Number(acc.current_exp || 0);
-    const earned = Math.max(0, curExp - baseExp), remaining = Math.max(0, target - curExp);
-    const pct = isMax ? 100 : Math.min(100, Math.max(0, earned / needed * 100));
-    const stText = cat === "paused" ? "Paused" : cat === "match" ? `In match (${acc.active_matches || 1})` : cat === "error" ? (acc.status || "Error") : (acc.status === "SEARCHING" ? "Searching" : "Online");
-    const c = { level, nextLvl, isMax, curExp, earned, needed, remaining, pct, cat, stText };
-    let card = $("acc-" + uid);
-    if (!card) { card = document.createElement("div"); card.id = "acc-" + uid; card.className = "node glow"; card.innerHTML = `<span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span><div class="node-inner"></div>`; card.style.animationDelay = (idx * 0.05) + "s"; }
-    if (card.parentNode !== box) box.appendChild(card);
-    Object.assign(card.dataset, { uid, nick: acc.nickname || "", status: cat, paused: cat === "paused" ? "1" : "0", auth: acc.auth_uid || "" });
-    const sig = [level, acc.nickname, acc.region, stText, cat, acc.initial_exp, curExp, acc.gained_exp, acc.avatar].join("|");
-    const inner = card.querySelector(".node-inner");
-    if (force || card._sig !== sig) { inner.innerHTML = nodeHTML(acc, uid, c); card._sig = sig; }
-    const tm = card.querySelector(".acc-time");
-    if (tm) { tm.dataset.uptime = Math.floor(acc.uptime_seconds || 0); tm.dataset.paused = cat === "paused" ? "1" : "0"; tm.textContent = fmtDur(acc.uptime_seconds || 0); }
+    const gid = String(acc.squad_id || "A").toUpperCase();
+    if (!groups[gid]) groups[gid] = [];
+    groups[gid].push({ acc, idx, cat: cats[idx] });
   });
+  const gids = Object.keys(groups).sort();
+
+  /* Remove obsolete group sections */
+  box.querySelectorAll(".group-section").forEach(g => {
+    if (!gids.includes(g.dataset.gid)) g.remove();
+  });
+
+  /* Build/update each group */
+  gids.forEach(gid => {
+    let section = box.querySelector(`.group-section[data-gid="${CSS.escape(gid)}"]`);
+    if (!section) {
+      section = document.createElement("div");
+      section.className = "group-section";
+      section.dataset.gid = gid;
+      section.innerHTML = `
+        <div class="group-head">
+          <div class="group-badge">${esc(gid)}</div>
+          <div>
+            <div class="group-title">Group ${esc(gid)}</div>
+            <div class="group-sub">Squad Team ${esc(gid)}</div>
+          </div>
+          <span class="group-count">0 / ${TEAM_SIZE}</span>
+        </div>
+        <div class="group-grid"></div>`;
+      /* Insert in sorted order */
+      const existing = Array.from(box.querySelectorAll(".group-section"));
+      let inserted = false;
+      for (const ex of existing) {
+        if (ex.dataset.gid.localeCompare(gid) > 0) {
+          box.insertBefore(section, ex);
+          inserted = true;
+          break;
+        }
+      }
+      if (!inserted) box.appendChild(section);
+    }
+
+    const grid = section.querySelector(".group-grid");
+    section.querySelector(".group-count").textContent = `${groups[gid].length} / ${TEAM_SIZE}`;
+
+    /* Remove accounts no longer in this group */
+    const uids = new Set(groups[gid].map(g => String(g.acc.uid)));
+    grid.querySelectorAll(".node").forEach(c => { if (!uids.has(c.dataset.uid)) c.remove(); });
+
+    /* Add / update cards */
+    groups[gid].forEach(({ acc, idx, cat }) => {
+      const uid = String(acc.uid);
+      const level = Math.min(100, Math.max(1, parseInt(acc.level) || 1));
+      const isMax = level >= 100, nextLvl = Math.min(100, level + 1);
+      const baseExp = EXP_TABLE[level] ?? 0, target = EXP_TABLE[nextLvl] ?? baseExp + 50000;
+      const needed = Math.max(1, target - baseExp), curExp = Number(acc.current_exp || 0);
+      const earned = Math.max(0, curExp - baseExp), remaining = Math.max(0, target - curExp);
+      const pct = isMax ? 100 : Math.min(100, Math.max(0, earned / needed * 100));
+      const stText = cat === "paused" ? "Paused" : cat === "match" ? `In match (${acc.active_matches || 1})` : cat === "error" ? (acc.status || "Error") : (acc.status === "SEARCHING" ? "Searching" : "Online");
+      const c = { level, nextLvl, isMax, curExp, earned, needed, remaining, pct, cat, stText };
+
+      let card = grid.querySelector(`#acc-${CSS.escape(uid)}`);
+      if (!card) {
+        card = document.createElement("div");
+        card.id = "acc-" + uid;
+        card.className = "node glow";
+        card.innerHTML = `<span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span><div class="node-inner"></div>`;
+        card.style.animationDelay = (idx * 0.05) + "s";
+      }
+      if (card.parentNode !== grid) grid.appendChild(card);
+      Object.assign(card.dataset, { uid, nick: acc.nickname || "", status: cat, paused: cat === "paused" ? "1" : "0", auth: acc.auth_uid || "" });
+
+      const sig = [level, acc.nickname, acc.region, stText, cat, acc.initial_exp, curExp, acc.gained_exp, acc.avatar].join("|");
+      const inner = card.querySelector(".node-inner");
+      if (force || card._sig !== sig) { inner.innerHTML = nodeHTML(acc, uid, c); card._sig = sig; }
+
+      const tm = card.querySelector(".acc-time");
+      if (tm) {
+        tm.dataset.uptime = Math.floor(acc.uptime_seconds || 0);
+        tm.dataset.paused = cat === "paused" ? "1" : "0";
+        tm.textContent = fmtDur(acc.uptime_seconds || 0);
+      }
+    });
+  });
+
   filterAccounts();
 }
+
 $("accounts").addEventListener("click", e => {
   const o = e.target.closest("[data-open]"); if (o) return openModal(o.dataset.open);
   const b = e.target.closest("[data-act]"); if (!b) return;
@@ -1597,19 +1728,28 @@ $("accounts").addEventListener("click", e => {
   const uid = card.dataset.uid;
   ({ pause: () => togglePause(uid), restart: () => restartAcc(uid), sync: () => refreshAcc(uid), delete: () => deleteAccount(uid, card.dataset.auth), copy: () => copyText(uid) })[b.dataset.act]?.();
 });
+
 function filterAccounts() {
-  const q = $("accountSearch").value.toLowerCase().trim(); let shown = 0;
-  const cards = document.querySelectorAll("#accounts .node");
-  cards.forEach(card => {
-    const st = card.dataset.status, paused = card.dataset.paused === "1";
-    let ok = !q || card.dataset.uid.toLowerCase().includes(q) || card.dataset.nick.toLowerCase().includes(q);
-    if (activeFilter === "in_match") ok = ok && st === "match";
-    else if (activeFilter === "online") ok = ok && !paused && ["online", "match", "search"].includes(st);
-    else if (activeFilter === "paused") ok = ok && paused;
-    card.hidden = !ok; if (ok) shown++;
+  const q = $("accountSearch").value.toLowerCase().trim();
+  let totalShown = 0, totalCards = 0;
+  document.querySelectorAll("#accounts .group-section").forEach(section => {
+    const cards = section.querySelectorAll(".node");
+    let shown = 0;
+    cards.forEach(card => {
+      totalCards++;
+      const st = card.dataset.status, paused = card.dataset.paused === "1";
+      let ok = !q || card.dataset.uid.toLowerCase().includes(q) || card.dataset.nick.toLowerCase().includes(q);
+      if (activeFilter === "in_match") ok = ok && st === "match";
+      else if (activeFilter === "online") ok = ok && !paused && ["online", "match", "search"].includes(st);
+      else if (activeFilter === "paused") ok = ok && paused;
+      card.hidden = !ok; if (ok) shown++;
+    });
+    section.hidden = shown === 0;
+    totalShown += shown;
   });
-  $("noMatch").hidden = !(cards.length && !shown);
+  $("noMatch").hidden = !(totalCards > 0 && totalShown === 0);
 }
+
 $("accountSearch").addEventListener("input", filterAccounts);
 $("nodeFilters").addEventListener("click", e => {
   const b = e.target.closest("button[data-f]"); if (!b) return;
