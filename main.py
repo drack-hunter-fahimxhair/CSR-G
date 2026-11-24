@@ -2962,40 +2962,96 @@ _match_counter_lock = asyncio.Lock()
 # ==================== ACCOUNTS FILE LOCK ====================
 _accounts_file_lock = asyncio.Lock()
 
+async def _read_accounts_file_unlocked() -> list:
+    if not os.path.exists(ACCOUNTS_FILE):
+        return []
+    try:
+        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print_warning(f"[ACCOUNTS] read {ACCOUNTS_FILE} failed: {e}")
+        return []
+
+async def _write_accounts_file_unlocked(accounts: list):
+    tmp = ACCOUNTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(accounts, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, ACCOUNTS_FILE)
+
 async def _remove_from_accounts_file(identifiers: set) -> list:
-    """
-    Remove any entries in accounts.json whose `uid` matches any identifier.
-    Returns the list of removed entries. Safe to call concurrently.
-    """
     removed = []
     if not identifiers: return removed
     if not os.path.exists(ACCOUNTS_FILE): return removed
     async with _accounts_file_lock:
-        try:
-            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                accs = json.load(f)
-        except Exception as e:
-            print_warning(f"[DELETE] read {ACCOUNTS_FILE} failed: {e}")
-            return removed
-        if not isinstance(accs, list): return removed
+        accs = await _read_accounts_file_unlocked()
+        if not accs: return removed
         kept = []
         for a in accs:
             if not isinstance(a, dict):
                 kept.append(a); continue
             auid = str(a.get("uid", "")).strip()
-            if auid and auid in identifiers:
+            atok = str(a.get("token", "")).strip()
+            if (auid and auid in identifiers) or (atok and (atok in identifiers or f"tok_{atok[:20]}" in identifiers)):
                 removed.append(a)
             else:
                 kept.append(a)
         if removed:
             try:
-                tmp = ACCOUNTS_FILE + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(kept, f, indent=2, ensure_ascii=False)
-                os.replace(tmp, ACCOUNTS_FILE)
+                await _write_accounts_file_unlocked(kept)
             except Exception as e:
                 print_error(f"[DELETE] save {ACCOUNTS_FILE} failed: {e}")
     return removed
+
+async def _stop_and_cleanup_account(identifiers: set):
+    resolved = {str(x).strip() for x in identifiers if str(x).strip()}
+    for u in list(resolved):
+        v = bot_state.game_to_auth_id.get(u)
+        if v: resolved.add(str(v))
+        v2 = bot_state.auth_to_game_id.get(u)
+        if v2: resolved.add(str(v2))
+    for u in list(resolved):
+        acc = bot_state.accounts.get(u)
+        if acc and acc.get("auth_uid"):
+            resolved.add(str(acc["auth_uid"]))
+    for gid, gacc in list(bot_state.accounts.items()):
+        if str(gacc.get("auth_uid", "")) in resolved:
+            resolved.add(str(gid))
+    for u in list(resolved):
+        cached = cache_get(u)
+        if cached:
+            try:
+                if cached.get("account_id"): resolved.add(str(cached["account_id"]))
+                if cached.get("auth_uid"): resolved.add(str(cached["auth_uid"]))
+            except Exception: pass
+
+    for u in resolved:
+        if u in bot_state.account_workers:
+            try: bot_state.account_workers[u].cancel()
+            except Exception: pass
+            bot_state.account_workers.pop(u, None)
+
+    removed_memory = []
+    for u in resolved:
+        if u in bot_state.accounts:
+            removed_memory.append(u)
+            del bot_state.accounts[u]
+        bot_state.paused.discard(u)
+        bot_state.toggle_pause(u, False)
+        bot_state.account_credentials.pop(u, None)
+        bot_state.game_to_auth_id.pop(u, None)
+        bot_state.auth_to_game_id.pop(u, None)
+        try: cache_invalidate(u)
+        except Exception: pass
+        try: await _clear_team_joined(u)
+        except Exception: pass
+        for gid, t in list(_teams_state.items()):
+            if u in t["peers"]:
+                t["peers"].pop(u, None)
+                if t["leader_uid"] == u:
+                    t["leader_uid"] = None
+                    t["team_code"] = None
+    return resolved, removed_memory
     
 async def _inc_match(uid):
     async with _match_counter_lock:
@@ -4627,15 +4683,20 @@ async def _autoload_accounts():
             if not isinstance(a, dict): continue
             uid = str(a.get("uid", "")).strip()
             password = str(a.get("password", "")).strip()
+            token = str(a.get("token", "")).strip()
             region = str(a.get("region", "")).strip() or None
             clan_id = str(a.get("clan_id", "")).strip() or CLAN_ID_DEFAULT
             squad_id = str(a.get("squad_id", "")).strip().upper() or _group_for_index(i)
-            if not uid or not password: continue
-            task = asyncio.create_task(account_loop_guest(
-                uid, password, region_override=region,
-                clan_override=clan_id, squad_id=squad_id))
-            bot_state.account_workers[uid] = task
-            print_info(f"worker {uid} ({i+1}/{len(accounts)}) region={region} squad={squad_id}")
+            if token and not (uid and password):
+                task = asyncio.create_task(account_loop_token(token, squad_id=squad_id))
+                bot_state.account_workers[f"tok_{token[:20]}"] = task
+                print_info(f"token worker ({i+1}/{len(accounts)}) squad={squad_id}")
+            elif uid and password:
+                task = asyncio.create_task(account_loop_guest(
+                    uid, password, region_override=region,
+                    clan_override=clan_id, squad_id=squad_id))
+                bot_state.account_workers[uid] = task
+                print_info(f"worker {uid} ({i+1}/{len(accounts)}) region={region} squad={squad_id}")
             await asyncio.sleep(0.5)
         except Exception as e:
             print_error(f"[BOOT] worker {i+1}: {e}")
@@ -4788,18 +4849,32 @@ async def api_create_team(request):
 async def api_account_add(request):
     try:
         body = await request.json()
-        squad_id = _assign_squad_for_new_account()
+        squad_id = str(body.get("squad_id", "") or _assign_squad_for_new_account()).strip().upper()
+        region = str(body.get("region", "BD") or "BD").strip().upper()
+        clan_id = str(body.get("clan_id", "") or CLAN_ID_DEFAULT).strip()
+
         if body.get("token"):
             token = str(body["token"]).strip()
             if not token:
                 return aiohttp.web.json_response({"status": "error", "error": "empty token"})
+            async with _accounts_file_lock:
+                accs = await _read_accounts_file_unlocked()
+                if not any(isinstance(a, dict) and str(a.get("token", "")).strip() == token for a in accs):
+                    accs.append({"token": token, "region": region, "clan_id": clan_id, "squad_id": squad_id})
+                    await _write_accounts_file_unlocked(accs)
             asyncio.create_task(account_loop_token(token, squad_id=squad_id))
             return aiohttp.web.json_response({"status": "ok"})
+
         uid = str(body.get("uid", "")).strip()
         password = str(body.get("password", "")).strip()
         if not uid or not password:
             return aiohttp.web.json_response({"status": "error", "error": "uid/password required"})
-        asyncio.create_task(account_loop_guest(uid, password, squad_id=squad_id))
+        async with _accounts_file_lock:
+            accs = await _read_accounts_file_unlocked()
+            if not any(isinstance(a, dict) and str(a.get("uid", "")).strip() == uid for a in accs):
+                accs.append({"uid": uid, "password": password, "region": region, "clan_id": clan_id, "squad_id": squad_id})
+                await _write_accounts_file_unlocked(accs)
+        asyncio.create_task(account_loop_guest(uid, password, region_override=region, clan_override=clan_id, squad_id=squad_id))
         return aiohttp.web.json_response({"status": "ok"})
     except Exception as e:
         return aiohttp.web.json_response({"status": "error", "error": str(e)})
@@ -4975,6 +5050,205 @@ async def api_get_raw_accounts(request):
     except Exception as e:
         return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
 
+async def api_accounts_json_upsert(request):
+    try:
+        body = await request.json()
+        old_uid = str(body.get("old_uid", "") or "").strip()
+        old_index = body.get("old_index", None)
+        uid = str(body.get("uid", "") or "").strip()
+        password = str(body.get("password", "") or "").strip()
+        token = str(body.get("token", "") or "").strip()
+        region = str(body.get("region", "BD") or "BD").strip().upper()
+        clan_id = str(body.get("clan_id", CLAN_ID_DEFAULT) or CLAN_ID_DEFAULT).strip()
+        squad_id = str(body.get("squad_id", "") or _assign_squad_for_new_account()).strip().upper()
+        apply_live = bool(body.get("apply_live", True))
+
+        if token and not (uid and password):
+            new_entry = {"token": token, "region": region, "clan_id": clan_id, "squad_id": squad_id}
+        elif uid and password:
+            new_entry = {"uid": uid, "password": password, "region": region, "clan_id": clan_id, "squad_id": squad_id}
+        else:
+            return aiohttp.web.json_response({"ok": False, "error": "UID ও Password (অথবা Token) দিতে হবে"}, status=400)
+
+        async with _accounts_file_lock:
+            accs = await _read_accounts_file_unlocked()
+            is_edit = bool(old_uid) or (old_index is not None and isinstance(old_index, int) and 0 <= old_index < len(accs))
+            if is_edit:
+                target_idx = None
+                if old_uid:
+                    for i, a in enumerate(accs):
+                        if isinstance(a, dict) and str(a.get("uid", "")).strip() == old_uid:
+                            target_idx = i; break
+                if target_idx is None and old_index is not None and 0 <= old_index < len(accs):
+                    target_idx = old_index
+                if target_idx is None:
+                    return aiohttp.web.json_response({"ok": False, "error": "Account not found in accounts.json"}, status=404)
+                if uid:
+                    for i, a in enumerate(accs):
+                        if i != target_idx and isinstance(a, dict) and str(a.get("uid", "")).strip() == uid:
+                            return aiohttp.web.json_response({"ok": False, "error": f"UID {uid} already exists"}, status=400)
+                accs[target_idx] = new_entry
+            else:
+                if uid and any(isinstance(a, dict) and str(a.get("uid", "")).strip() == uid for a in accs):
+                    return aiohttp.web.json_response({"ok": False, "error": f"UID {uid} already exists"}, status=400)
+                accs.append(new_entry)
+            await _write_accounts_file_unlocked(accs)
+
+        if apply_live:
+            kill_ids = {x for x in (old_uid, uid) if x}
+            if token: kill_ids.add(f"tok_{token[:20]}")
+            await _stop_and_cleanup_account(kill_ids)
+            await asyncio.sleep(0.3)
+            if token and not (uid and password):
+                t = asyncio.create_task(account_loop_token(token, squad_id=squad_id))
+                bot_state.account_workers[f"tok_{token[:20]}"] = t
+            else:
+                t = asyncio.create_task(account_loop_guest(uid, password, region_override=region, clan_override=clan_id, squad_id=squad_id))
+                bot_state.account_workers[uid] = t
+
+        print_success(f"[ACCOUNTS-JSON] {'Updated' if is_edit else 'Added'} {uid or token[:12]} [Group {squad_id}]")
+        return aiohttp.web.json_response({"ok": True, "data": accs})
+    except Exception as e:
+        traceback.print_exc()
+        return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
+
+async def api_accounts_json_delete(request):
+    try:
+        body = await request.json()
+        uid = str(body.get("uid", "") or "").strip()
+        index = body.get("index", None)
+        stop_live = bool(body.get("stop_live", True))
+        removed_entry = None
+
+        async with _accounts_file_lock:
+            accs = await _read_accounts_file_unlocked()
+            if uid:
+                kept = []
+                for a in accs:
+                    if isinstance(a, dict) and str(a.get("uid", "")).strip() == uid and removed_entry is None:
+                        removed_entry = a
+                    else:
+                        kept.append(a)
+                accs = kept
+            elif index is not None and isinstance(index, int) and 0 <= index < len(accs):
+                removed_entry = accs.pop(index)
+            else:
+                return aiohttp.web.json_response({"ok": False, "error": "uid or valid index required"}, status=400)
+            await _write_accounts_file_unlocked(accs)
+
+        if stop_live and isinstance(removed_entry, dict):
+            kill_ids = set()
+            if removed_entry.get("uid"): kill_ids.add(str(removed_entry["uid"]).strip())
+            if removed_entry.get("token"):
+                tok = str(removed_entry["token"]).strip()
+                kill_ids.add(tok); kill_ids.add(f"tok_{tok[:20]}")
+            if kill_ids:
+                await _stop_and_cleanup_account(kill_ids)
+
+        print_warning(f"[ACCOUNTS-JSON] Deleted account {uid or index}")
+        return aiohttp.web.json_response({"ok": True, "data": accs})
+    except Exception as e:
+        traceback.print_exc()
+        return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
+
+async def api_save_raw_accounts(request):
+    try:
+        body = await request.json()
+        raw_data = body.get("data")
+        sync_live = bool(body.get("sync_live", False))
+        if not isinstance(raw_data, list):
+            return aiohttp.web.json_response({"ok": False, "error": "JSON must be an array [...]"}, status=400)
+
+        cleaned = []
+        seen_uids = set()
+        seen_tokens = set()
+        for idx, item in enumerate(raw_data):
+            if not isinstance(item, dict):
+                return aiohttp.web.json_response({"ok": False, "error": f"Item #{idx+1} must be an object {{...}}"}, status=400)
+            uid = str(item.get("uid", "") or "").strip()
+            password = str(item.get("password", "") or "").strip()
+            token = str(item.get("token", "") or "").strip()
+            if not token and not (uid and password):
+                return aiohttp.web.json_response({"ok": False, "error": f"Item #{idx+1} requires uid+password or token"}, status=400)
+
+            if uid and password:
+                if uid in seen_uids:
+                    return aiohttp.web.json_response({"ok": False, "error": f"Duplicate UID: {uid}"}, status=400)
+                seen_uids.add(uid)
+            elif token:
+                if token in seen_tokens:
+                    return aiohttp.web.json_response({"ok": False, "error": f"Duplicate Token at item #{idx+1}"}, status=400)
+                seen_tokens.add(token)
+
+            entry = dict(item)
+            if uid: entry["uid"] = uid
+            if password: entry["password"] = password
+            if token: entry["token"] = token
+            entry["region"] = str(item.get("region", "BD") or "BD").strip().upper()
+            entry["clan_id"] = str(item.get("clan_id", CLAN_ID_DEFAULT) or CLAN_ID_DEFAULT).strip()
+            entry["squad_id"] = str(item.get("squad_id", _group_for_index(idx)) or _group_for_index(idx)).strip().upper()
+            cleaned.append(entry)
+
+        async with _accounts_file_lock:
+            old_accs = await _read_accounts_file_unlocked()
+            await _write_accounts_file_unlocked(cleaned)
+
+        if sync_live:
+            def _key(a):
+                if a.get("uid") and a.get("password"): return f"uid:{str(a['uid']).strip()}"
+                if a.get("token"): return f"tok:{str(a['token']).strip()}"
+                return None
+
+            old_map = {_key(a): a for a in old_accs if isinstance(a, dict) and _key(a)}
+            new_map = {_key(a): a for a in cleaned if _key(a)}
+
+            # রিমুভ হওয়া অ্যাকাউন্ট বন্ধ করা
+            for k, old_a in old_map.items():
+                if k not in new_map:
+                    kill_ids = set()
+                    if old_a.get("uid"): kill_ids.add(str(old_a["uid"]).strip())
+                    if old_a.get("token"):
+                        tok = str(old_a["token"]).strip()
+                        kill_ids.update({tok, f"tok_{tok[:20]}"})
+                    await _stop_and_cleanup_account(kill_ids)
+
+            # নতুন বা পরিবর্তিত অ্যাকাউন্ট চালু/রিস্টার্ট করা
+            for k, new_a in new_map.items():
+                old_a = old_map.get(k)
+                changed = (old_a is None) or any(
+                    str(old_a.get(f, "")) != str(new_a.get(f, ""))
+                    for f in ("password", "token", "region", "clan_id", "squad_id")
+                )
+                u = new_a.get("uid")
+                tok = new_a.get("token")
+                worker_key = u if (u and new_a.get("password")) else f"tok_{tok[:20]}"
+
+                if changed or worker_key not in bot_state.account_workers:
+                    if old_a is not None:
+                        kill_ids = set()
+                        if u: kill_ids.add(u)
+                        if tok: kill_ids.update({tok, f"tok_{tok[:20]}"})
+                        await _stop_and_cleanup_account(kill_ids)
+                        await asyncio.sleep(0.1)
+
+                    if u and new_a.get("password"):
+                        t = asyncio.create_task(account_loop_guest(
+                            u, new_a["password"],
+                            region_override=new_a["region"],
+                            clan_override=new_a["clan_id"],
+                            squad_id=new_a["squad_id"]
+                        ))
+                        bot_state.account_workers[u] = t
+                    elif tok:
+                        t = asyncio.create_task(account_loop_token(tok, squad_id=new_a["squad_id"]))
+                        bot_state.account_workers[f"tok_{tok[:20]}"] = t
+
+        print_success(f"[ACCOUNTS-JSON] Saved {len(cleaned)} account(s) (sync_live={sync_live})")
+        return aiohttp.web.json_response({"ok": True, "data": cleaned})
+    except Exception as e:
+        traceback.print_exc()
+        return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
+
 async def account_loop_token(token, squad_id="A"):
     squad = str(squad_id or "A").upper()
     tok_key = f"tok_{token[:20]}"
@@ -5061,6 +5335,9 @@ async def start_web_server():
     app.router.add_post("/api/account/pause", api_account_pause)
     app.router.add_post("/api/account/pause_all", api_account_pause_all)
     app.router.add_get("/api/accounts/raw", api_get_raw_accounts)
+    app.router.add_post("/api/accounts/raw", api_save_raw_accounts)
+    app.router.add_post("/api/accounts/json/upsert", api_accounts_json_upsert)
+    app.router.add_post("/api/accounts/json/delete", api_accounts_json_delete)
     app.router.add_post("/api/logs/clear", api_logs_clear)
     app.router.add_get("/api/progress", api_progress)
     runner = aiohttp.web.AppRunner(app)
