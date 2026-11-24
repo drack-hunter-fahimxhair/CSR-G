@@ -488,7 +488,6 @@ def _assign_squad_for_new_account() -> str:
             return gid
     return "A"
 
-_restart_state = {"lock": asyncio.Lock(), "finished_bots": set(), "target": None, "restarting": False}
 
 # --- Auto Equip Workflow (Bangladesh Server: clientbp.ppmainecoonghj.com) ---
 async def send_debug_request_async(http_client, url, host_domain, jwt_token, hex_body, step_name,
@@ -661,20 +660,57 @@ async def change_bio(jwt_token, bio_text, server_url=None):
     except Exception:
         return False
 
-async def _mark_bot_match_finished(account_id):
-    async with _restart_state["lock"]:
-        if _restart_state["restarting"]: return
-        _restart_state["finished_bots"].add(str(account_id))
-        n_done = len(_restart_state["finished_bots"])
-        if _restart_state["target"] is None:
-            active_ids = {uid for uid, a in bot_state.accounts.items() if a.get("status") not in ("OFFLINE",)}
-            _restart_state["target"] = max(1, min(TEAM_SIZE, len(active_ids))) if active_ids else TEAM_SIZE
-        target = _restart_state["target"]
-        print_success(f"[RESTART] {account_id} → {n_done}/{target}")
+_squad_restart_states: Dict[str, dict] = {}
+
+def _get_squad_restart(group_id: str = "A") -> dict:
+    gid = str(group_id or "A").upper()
+    if gid not in _squad_restart_states:
+        _squad_restart_states[gid] = {
+            "lock": asyncio.Lock(),
+            "finished_bots": set(),
+            "target": None,
+            "restarting": False,
+            "seq": 0,
+        }
+    return _squad_restart_states[gid]
+
+async def _schedule_squad_restart(group_id: str):
+    gid = str(group_id or "A").upper()
+    await asyncio.sleep(3.0)
+    st = _get_squad_restart(gid)
+    async with st["lock"]:
+        st["seq"] += 1
+        st["finished_bots"].clear()
+        st["target"] = None
+        st["restarting"] = False
+    print_warning(f"[RESTART-{gid}] 🔄 Squad {gid} restarting now (other squads untouched)...")
+
+async def _mark_bot_match_finished(account_id, squad_id: Optional[str] = None):
+    uid_str = str(account_id)
+    if not squad_id:
+        acc = bot_state.accounts.get(uid_str, {})
+        squad_id = acc.get("squad_id", "A")
+    gid = str(squad_id or "A").upper()
+    st = _get_squad_restart(gid)
+
+    async with st["lock"]:
+        if st["restarting"]:
+            return
+        st["finished_bots"].add(uid_str)
+        n_done = len(st["finished_bots"])
+        if st["target"] is None:
+            active_ids = {
+                uid for uid, a in bot_state.accounts.items()
+                if str(a.get("squad_id", "A") or "A").upper() == gid
+                and a.get("status") not in ("OFFLINE", "PAUSED")
+            }
+            st["target"] = max(1, min(TEAM_SIZE, len(active_ids))) if active_ids else TEAM_SIZE
+        target = st["target"]
+        print_success(f"[RESTART-{gid}] {uid_str} → {n_done}/{target}")
         if n_done >= target:
-            _restart_state["restarting"] = True
-            print_warning(f"[RESTART] ✅ All {target} bots done! Restart in 3s...")
-            asyncio.create_task(_schedule_restart())
+            st["restarting"] = True
+            print_warning(f"[RESTART-{gid}] ✅ Squad {gid} ({target} bots) done! Restart in 3s...")
+            asyncio.create_task(_schedule_squad_restart(gid))
 
 _no_match_state = {"lock": asyncio.Lock(), "global_last_match": None, "restart_triggered": False}
 async def _mark_match_found(account_id=None):
@@ -728,7 +764,8 @@ async def _no_match_watchdog():
     while True:
         await asyncio.sleep(10.0)
         try:
-            if _restart_state["restarting"]: return
+            if any(s["restarting"] for s in _squad_restart_states.values()):
+                continue
             if _no_match_state["restart_triggered"]: return
             if _any_bot_in_match():
                 async with _no_match_state["lock"]:
@@ -754,9 +791,11 @@ async def _no_match_watchdog():
                         team["triggered"] = True
                         msg = f"[TEAM-STUCK-{gid}] {stuck} bot no match ≥{NO_MATCH_RESTART_TIMEOUT:.0f}s"
                         print_warning(msg); bot_state.log(msg, "warning")
-                        async with _restart_state["lock"]:
-                            _restart_state["restarting"] = True
-                        await _schedule_restart(); return
+                        st = _get_squad_restart(gid)
+                        async with st["lock"]:
+                            if not st["restarting"]:
+                                st["restarting"] = True
+                                asyncio.create_task(_schedule_squad_restart(gid))
             if not _all_bots_are_online_or_searching():
                 async with _no_match_state["lock"]:
                     _no_match_state["global_last_match"] = time.time()
@@ -769,11 +808,15 @@ async def _no_match_watchdog():
                 async with _no_match_state["lock"]:
                     if _no_match_state["restart_triggered"]: continue
                     _no_match_state["restart_triggered"] = True
-                msg = f"[NO-MATCH] No match for {elapsed:.0f}s → restart!"
+                msg = f"[NO-MATCH] No match for {elapsed:.0f}s → restart stuck squads!"
                 print_warning(msg); bot_state.log(msg, "warning")
-                async with _restart_state["lock"]:
-                    _restart_state["restarting"] = True
-                await _schedule_restart(); return
+                for gid in list(_teams_state.keys()):
+                    st = _get_squad_restart(gid)
+                    async with st["lock"]:
+                        if not st["restarting"]:
+                            st["restarting"] = True
+                            asyncio.create_task(_schedule_squad_restart(gid))
+                return
         except Exception as e:
             print_warning(f"[NO-MATCH] error: {e}")
 
@@ -3032,7 +3075,8 @@ def cache_invalidate(uid):
 
 # ==================== PLAY GAME ====================
 async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
-                    account_id, player_region, client_version, key, iv, match_index):
+                    account_id, player_region, client_version, key, iv, match_index,
+                    squad_id="A"):
     match_start_time = time.time()
     ping_task = None; sock = None
     ping_stop = asyncio.Event()
@@ -3188,19 +3232,19 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             try: await move_task
             except asyncio.CancelledError: pass
             except Exception: pass
-            
+
         if force_move_task:
             force_move_task.cancel()
             try: await force_move_task
             except asyncio.CancelledError: pass
             except Exception: pass
-            
+
         if completed_cleanly:
             try:
                 bot_state.increment_match(uid_str)
                 print_premium(f"Match #{match_index} Complete | UID: {uid_str}",
                               color=PX.GOLD, icon=I["crown"])
-                try: await _mark_bot_match_finished(uid_str)
+                try: await _mark_bot_match_finished(uid_str, squad_id=squad_id)
                 except Exception: pass
                 async def _post_exp(uid):
                     try:
@@ -3224,7 +3268,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
 
 # ==================== PLAY GAME (CS MODE) ====================
 async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
-                       account_id, player_region, client_version, key, iv, match_index):
+                       account_id, player_region, client_version, key, iv, match_index,
+                       squad_id="A"):
     match_start_time = time.time()
     ping_task = None; move_task = None; skill_task = None; force_move_task = None; sock = None
     ping_stop = asyncio.Event()
@@ -3290,7 +3335,7 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
                         move_task = asyncio.create_task(
                             auto_move_loop(sock, resolved_ip, port, udp_key_bytes, match_code,
                                            move_state, ping_stop, label=f"[{tag}]"))
-                    
+
                     if HOMER_SKILL_ENABLED and skill_task is None:
                         skill_task = asyncio.create_task(
                             homer_skill_loop(sock, resolved_ip, port, udp_key_bytes, match_code,
@@ -3308,8 +3353,6 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
                     frame = await decode_packet(response, udp_key_bytes, match_code)
                     if not frame:
                         move_state.undecoded += 1
-                        # Reliable packets we cannot decrypt still carry a readable order id: ack them,
-                        # otherwise the server resends them endlessly
                         oid = await peek_reliable_order(response, udp_key_bytes, match_code)
                         if oid is not None:
                             nxt = (oid + 1) & 0xFFFF
@@ -3343,7 +3386,6 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
                                 await loop.sock_sendto(sock, fin_ack, server_addr)
                             except Exception: pass
                             continue
-                        # Cumulative ACK (orderId + 1) for every reliable packet
                         if (flags & 1) and order_id is not None:
                             try:
                                 next_expected = (order_id + 1) & 0xFFFF
@@ -3408,7 +3450,7 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
             try:
                 bot_state.increment_match(uid_str)
                 print_premium(f"{tag} Complete", color=PX.GOLD, icon=I["crown"])
-                try: await _mark_bot_match_finished(uid_str)
+                try: await _mark_bot_match_finished(uid_str, squad_id=squad_id)
                 except Exception: pass
                 async def _post_exp(uid):
                     try:
@@ -3423,6 +3465,7 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
         except Exception: pass
 
 # ==================== FUNCTIONAL LONE WOLF ====================
+# ==================== FUNCTIONAL LONE WOLF ====================
 async def functional_lone_wolf(addrs, starter_packet, account_region, client_version,
                                 key, iv, account_id="", account_data=None, max_reconnects=10,
                                 squad_id="A"):
@@ -3435,6 +3478,8 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     uid_str = str(account_id)
     gid = str(squad_id or "A").upper()
     team_state = _get_team(gid)
+    squad_restart = _get_squad_restart(gid)
+    my_restart_seq = squad_restart["seq"]
 
     current_token = starter_packet
     current_key = key; current_iv = iv
@@ -3536,6 +3581,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     async def _team_coordinator():
         try:
             while True:
+                if squad_restart["seq"] != my_restart_seq: return
                 async with team_state["lock"]:
                     n = len(team_state["peers"])
                 if n >= TEAM_SIZE: break
@@ -3606,7 +3652,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                           color=PX.EMERALD, icon=I["rocket"])
             try: bot_state.update_status(uid_str, "SEARCHING", 0)
             except Exception: pass
-            while _team_active["flag"] and not _match_played["flag"]:
+            while _team_active["flag"] and not _match_played["flag"] and squad_restart["seq"] == my_restart_seq:
                 try:
                     if bot_state.is_paused(uid_str): break
                     async with team_state["lock"]:
@@ -3626,10 +3672,9 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                        f"(again after {CS_TEAM_START_RETRY:.0f}s without a match)")
                 except Exception as e: print_warning(f"TEAM[{gid}] start_match err: {e}")
                 if CS_MODE_ENABLED:
-                    # CS: repeating start restarts the search — wait for the match instead
                     retry_at = time.time() + CS_TEAM_START_RETRY
                     while (time.time() < retry_at and _team_active["flag"] and not _match_played["flag"]
-                           and not bot_state.is_paused(uid_str)):
+                           and squad_restart["seq"] == my_restart_seq and not bot_state.is_paused(uid_str)):
                         await asyncio.sleep(0.5)
                     continue
                 try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
@@ -3641,6 +3686,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     async def _member_match_trigger():
         try:
             await asyncio.sleep(TEAM_READY_DELAY + 18.0)
+            if squad_restart["seq"] != my_restart_seq: return
             async with team_state["lock"]:
                 if team_state["leader_uid"] == uid_str: return
             print_premium(f"TEAM[{gid}] Member {uid_str} ready loop",
@@ -3648,7 +3694,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
             try: bot_state.update_status(uid_str, "SEARCHING", 0)
             except Exception: pass
             my_id = current_account_data.get('account_id', uid_str) if current_account_data else uid_str
-            while _team_active["flag"] and not _match_played["flag"]:
+            while _team_active["flag"] and not _match_played["flag"] and squad_restart["seq"] == my_restart_seq:
                 try:
                     if bot_state.is_paused(uid_str): break
                     if _writer_ref["w"] and not _writer_ref["w"].is_closing():
@@ -3664,7 +3710,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 if CS_MODE_ENABLED:
                     retry_at = time.time() + CS_TEAM_START_RETRY
                     while (time.time() < retry_at and _team_active["flag"] and not _match_played["flag"]
-                           and not bot_state.is_paused(uid_str)):
+                           and squad_restart["seq"] == my_restart_seq and not bot_state.is_paused(uid_str)):
                         await asyncio.sleep(0.5)
                     continue
                 try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
@@ -3675,7 +3721,14 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
     try:
         while True:
+            if squad_restart["seq"] != my_restart_seq:
+                print_warning(f"[RESTART-{gid}] {uid_str} restarting for Squad {gid}")
+                try: bot_state.update_status(uid_str, "OFFLINE", 0)
+                except Exception: pass
+                return
             while bot_state.is_paused(uid_str):
+                if squad_restart["seq"] != my_restart_seq:
+                    return
                 try: bot_state.update_status(uid_str, "PAUSED", 0)
                 except Exception: pass
                 await asyncio.sleep(1.0)
@@ -3772,6 +3825,11 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 while True:
                     play_matches[:] = [m for m in play_matches if not m.done()]
                     if bot_state.is_paused(uid_str): break
+                    if squad_restart["seq"] != my_restart_seq:
+                        print_warning(f"[RESTART-{gid}] {uid_str} restarting for Squad {gid}")
+                        try: bot_state.update_status(uid_str, "OFFLINE", 0)
+                        except Exception: pass
+                        return
                     if _match_played["flag"]:
                         try: data = await asyncio.wait_for(reader.read(8192), timeout=1.0)
                         except asyncio.TimeoutError: continue
@@ -3893,7 +3951,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                     game_fn(server_ip_port, thunder, sharma, udp_key,
                                             match_code, effective_acc_id, "ID",
                                             client_version, current_key, current_iv,
-                                            match_index=match_index))
+                                            match_index=match_index, squad_id=gid))
                                 play_matches.append(new_match)
 
                                 async def drain_gw():
@@ -4669,9 +4727,9 @@ async def api_stats(request):
             "team_code": first_team_code,
             "leader_uid": first_leader,
             "team_size": sum(len(t["peers"]) for t in _teams_state.values()),
-            "restart_finished": len(_restart_state["finished_bots"]),
-            "restart_target": _restart_state["target"],
-            "restarting": _restart_state["restarting"],
+            "restart_finished": sum(len(s["finished_bots"]) for s in _squad_restart_states.values()),
+            "restart_target": sum((s["target"] or 0) for s in _squad_restart_states.values()) or None,
+            "restarting": any(s["restarting"] for s in _squad_restart_states.values()),
         }
         return aiohttp.web.Response(text=json.dumps(data, default=str, ensure_ascii=False),
                                     content_type="application/json", charset="utf-8")
@@ -4918,54 +4976,75 @@ async def api_get_raw_accounts(request):
         return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
 
 async def account_loop_token(token, squad_id="A"):
-    print_info(f"TOKEN Login {token[:20]}... (squad={squad_id})")
-    try:
-        vc = await version_config("ID")
-        if not vc: return
-        release_version, client_version, server_url, gop_1, app_version = vc
-        url = f"https://100067.connect.garena.com/oauth/token/inspect?token={token}"
-        hdrs = {"User-Agent":"GarenaMSDK/4.0.19P4(G011A ;Android 9;en;US;)"}
-        r = await client.get(url, headers=hdrs)
-        if r.status_code != 200: return
-        data = r.json()
-        if 'error' in data: return
-        open_id = data.get('open_id'); platform = data.get('platform', 4)
-        if not open_id: return
-        major_payload, login_payload = await get_payload(
-            token, open_id, platform, client_version)
-        res_json = await major_login(major_payload, server_url, release_version)
-        if not res_json: return
-        def _gd(k):
-            v = res_json.get(str(k))
-            if isinstance(v, dict) and "data" in v: return v["data"]
-            return v
-        acc_id_raw = _gd(1); jwt_token = _gd(8)
-        server_url_raw = _gd(10); server_time = _gd(21)
-        region_raw = _gd(2) or "ID"
-        aes_ak, iv_i = _extract_key_iv(res_json)
-        if not (jwt_token and server_url_raw and aes_ak): return
-        ld = await get_login_data(login_payload, jwt_token, server_url_raw, release_version)
-        def _gf(f, d=None):
-            v = (ld or {}).get(str(f), {}).get("data")
-            return v if v is not None else d
-        level = int(_gf(6,1) or 1); exp = int(_gf(7,0) or 0)
-        nickname = _gf(4, f"Player_{acc_id_raw}") or f"Player_{acc_id_raw}"
-        ad = {'account_id':acc_id_raw,'nickname':nickname,'region':region_raw,
-            'level':level,'exp':exp,'likes':int(_gf(8,0) or 0),
-            'open_id':open_id,'access_token':token,'platform':str(platform),
-            'token':jwt_token,'server_time':server_time,
-            'aes_ak':aes_ak,'iv_i':iv_i,
-            'functional_addrs':_gf_field(ld, 14),
-            'informational_addrs':_gf_field(ld, 32),
-            'release_version':release_version,'client_version':client_version,
-            'server_url':server_url_raw,'login_payload_data':login_payload,
-            'auth_type':'token','auth_token':token,
-            'squad_id': str(squad_id or "A").upper()}
-        _register_credentials(ad)
-        cache_set(f"tok_{token[:20]}", ad)
-        await run_account_worker(ad, str(acc_id_raw), squad_id=squad_id)
-    except Exception as e:
-        print_error(f"TOKEN {e}")
+    squad = str(squad_id or "A").upper()
+    tok_key = f"tok_{token[:20]}"
+    bot_state.account_workers[tok_key] = asyncio.current_task()
+    acc_id_raw = None
+    while True:
+        try:
+            print_info(f"TOKEN Login {token[:20]}... (squad={squad})")
+            vc = await version_config("ID")
+            if not vc:
+                await asyncio.sleep(15); continue
+            release_version, client_version, server_url, gop_1, app_version = vc
+            url = f"https://100067.connect.garena.com/oauth/token/inspect?token={token}"
+            hdrs = {"User-Agent":"GarenaMSDK/4.0.19P4(G011A ;Android 9;en;US;)"}
+            r = await client.get(url, headers=hdrs)
+            if r.status_code != 200:
+                await asyncio.sleep(15); continue
+            data = r.json()
+            if 'error' in data:
+                await asyncio.sleep(15); continue
+            open_id = data.get('open_id'); platform = data.get('platform', 4)
+            if not open_id:
+                await asyncio.sleep(15); continue
+            major_payload, login_payload = await get_payload(
+                token, open_id, platform, client_version)
+            res_json = await major_login(major_payload, server_url, release_version)
+            if not res_json:
+                await asyncio.sleep(15); continue
+            def _gd(k):
+                v = res_json.get(str(k))
+                if isinstance(v, dict) and "data" in v: return v["data"]
+                return v
+            acc_id_raw = _gd(1); jwt_token = _gd(8)
+            server_url_raw = _gd(10); server_time = _gd(21)
+            region_raw = _gd(2) or "ID"
+            aes_ak, iv_i = _extract_key_iv(res_json)
+            if not (jwt_token and server_url_raw and aes_ak):
+                await asyncio.sleep(15); continue
+            ld = await get_login_data(login_payload, jwt_token, server_url_raw, release_version)
+            def _gf(f, d=None):
+                v = (ld or {}).get(str(f), {}).get("data")
+                return v if v is not None else d
+            level = int(_gf(6,1) or 1); exp = int(_gf(7,0) or 0)
+            nickname = _gf(4, f"Player_{acc_id_raw}") or f"Player_{acc_id_raw}"
+            ad = {'account_id':acc_id_raw,'nickname':nickname,'region':region_raw,
+                'level':level,'exp':exp,'likes':int(_gf(8,0) or 0),
+                'open_id':open_id,'access_token':token,'platform':str(platform),
+                'token':jwt_token,'server_time':server_time,
+                'aes_ak':aes_ak,'iv_i':iv_i,
+                'functional_addrs':_gf_field(ld, 14),
+                'informational_addrs':_gf_field(ld, 32),
+                'release_version':release_version,'client_version':client_version,
+                'server_url':server_url_raw,'login_payload_data':login_payload,
+                'auth_type':'token','auth_token':token,
+                'squad_id': squad}
+            _register_credentials(ad)
+            cache_set(tok_key, ad)
+            bot_state.account_workers[str(acc_id_raw)] = asyncio.current_task()
+            await run_account_worker(ad, str(acc_id_raw), squad_id=squad)
+            await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            try:
+                if acc_id_raw:
+                    bot_state.update_status(str(acc_id_raw), "OFFLINE")
+                    await _clear_team_joined(str(acc_id_raw))
+            except Exception: pass
+            break
+        except Exception as e:
+            print_error(f"TOKEN {e}")
+            await asyncio.sleep(10)
 
 async def start_web_server():
     app = aiohttp.web.Application(middlewares=[_req_logger])
