@@ -94,23 +94,6 @@ AUTO_MOVE_DEFAULT_RTT     = 120
 STRAIGHT_RUN_SEC          = 5.0         # ৫ সেকেন্ড শুধু সোজা সামনে
 CIRCLE_MOVE_SEC           = 15.0        # ১৫ সেকেন্ড বর্তমান (circle/normal)
 
-# ★ CUSTOM MOVEMENT CYCLE CONFIG ★
-CUSTOM_CYCLE_ENABLED       = True   # False করলে পুরনো মুভমেন্ট সিস্টেমে ফিরে যাবে
-CUSTOM_CYCLE_STEPS         = [
-    ("run_1",         4.0),   # ৪.০ সেকেন্ড সোজা দৌড়াবে
-    ("crouch_walk",   0.8),   # ০.৮ সেকেন্ড বসে সামনের দিকে হাঁটবে
-    ("run_2",         0.5),   # ০.৫ সেকেন্ড আবার দৌড়াবে
-    ("jump",          0.4),   # ০.৪ সেকেন্ড লাফ দেবে
-    ("rotate_screen", 0.6),   # ০.৬ সেকেন্ড স্ক্রিন ঘোরাবে
-    ("walk",          0.8),   # ০.৮ সেকেন্ড আবার হাঁটবে
-    ("idle",          0.8),   # ০.৮ সেকেন্ড একটু থেমে থাকবে
-]
-CROUCH_WALK_SPEED          = 180    # বসে হাঁটার গতি
-JUMP_MOVE_SPEED            = 420    # লাফ দেওয়ার সময় সামনের গতি
-SCREEN_ROTATE_DEG_PER_SEC  = 180.0  # স্ক্রিন ঘোরার গতি (ডিগ্রি/সেকেন্ড)
-CUSTOM_CYCLE_TICK_INTERVAL = 0.05   # 20Hz স্মুথ আপডেট
-CUSTOM_CYCLE_LOG_STEPS     = True   # False করলে কনসোলে স্টেপ লগ দেখাবে না
-
 # ★ GLORY BOOST CONFIG ★
 GLORY_BOOST_ENABLED       = True
 GLORY_TICK_INTERVAL       = 0.05        # 20Hz fast sync
@@ -488,6 +471,7 @@ def _assign_squad_for_new_account() -> str:
             return gid
     return "A"
 
+_restart_state = {"lock": asyncio.Lock(), "finished_bots": set(), "target": None, "restarting": False}
 
 # --- Auto Equip Workflow (Bangladesh Server: clientbp.ppmainecoonghj.com) ---
 async def send_debug_request_async(http_client, url, host_domain, jwt_token, hex_body, step_name,
@@ -660,57 +644,20 @@ async def change_bio(jwt_token, bio_text, server_url=None):
     except Exception:
         return False
 
-_squad_restart_states: Dict[str, dict] = {}
-
-def _get_squad_restart(group_id: str = "A") -> dict:
-    gid = str(group_id or "A").upper()
-    if gid not in _squad_restart_states:
-        _squad_restart_states[gid] = {
-            "lock": asyncio.Lock(),
-            "finished_bots": set(),
-            "target": None,
-            "restarting": False,
-            "seq": 0,
-        }
-    return _squad_restart_states[gid]
-
-async def _schedule_squad_restart(group_id: str):
-    gid = str(group_id or "A").upper()
-    await asyncio.sleep(3.0)
-    st = _get_squad_restart(gid)
-    async with st["lock"]:
-        st["seq"] += 1
-        st["finished_bots"].clear()
-        st["target"] = None
-        st["restarting"] = False
-    print_warning(f"[RESTART-{gid}] 🔄 Squad {gid} restarting now (other squads untouched)...")
-
-async def _mark_bot_match_finished(account_id, squad_id: Optional[str] = None):
-    uid_str = str(account_id)
-    if not squad_id:
-        acc = bot_state.accounts.get(uid_str, {})
-        squad_id = acc.get("squad_id", "A")
-    gid = str(squad_id or "A").upper()
-    st = _get_squad_restart(gid)
-
-    async with st["lock"]:
-        if st["restarting"]:
-            return
-        st["finished_bots"].add(uid_str)
-        n_done = len(st["finished_bots"])
-        if st["target"] is None:
-            active_ids = {
-                uid for uid, a in bot_state.accounts.items()
-                if str(a.get("squad_id", "A") or "A").upper() == gid
-                and a.get("status") not in ("OFFLINE", "PAUSED")
-            }
-            st["target"] = max(1, min(TEAM_SIZE, len(active_ids))) if active_ids else TEAM_SIZE
-        target = st["target"]
-        print_success(f"[RESTART-{gid}] {uid_str} → {n_done}/{target}")
+async def _mark_bot_match_finished(account_id):
+    async with _restart_state["lock"]:
+        if _restart_state["restarting"]: return
+        _restart_state["finished_bots"].add(str(account_id))
+        n_done = len(_restart_state["finished_bots"])
+        if _restart_state["target"] is None:
+            active_ids = {uid for uid, a in bot_state.accounts.items() if a.get("status") not in ("OFFLINE",)}
+            _restart_state["target"] = max(1, min(TEAM_SIZE, len(active_ids))) if active_ids else TEAM_SIZE
+        target = _restart_state["target"]
+        print_success(f"[RESTART] {account_id} → {n_done}/{target}")
         if n_done >= target:
-            st["restarting"] = True
-            print_warning(f"[RESTART-{gid}] ✅ Squad {gid} ({target} bots) done! Restart in 3s...")
-            asyncio.create_task(_schedule_squad_restart(gid))
+            _restart_state["restarting"] = True
+            print_warning(f"[RESTART] ✅ All {target} bots done! Restart in 3s...")
+            asyncio.create_task(_schedule_restart())
 
 _no_match_state = {"lock": asyncio.Lock(), "global_last_match": None, "restart_triggered": False}
 async def _mark_match_found(account_id=None):
@@ -764,8 +711,7 @@ async def _no_match_watchdog():
     while True:
         await asyncio.sleep(10.0)
         try:
-            if any(s["restarting"] for s in _squad_restart_states.values()):
-                continue
+            if _restart_state["restarting"]: return
             if _no_match_state["restart_triggered"]: return
             if _any_bot_in_match():
                 async with _no_match_state["lock"]:
@@ -791,11 +737,9 @@ async def _no_match_watchdog():
                         team["triggered"] = True
                         msg = f"[TEAM-STUCK-{gid}] {stuck} bot no match ≥{NO_MATCH_RESTART_TIMEOUT:.0f}s"
                         print_warning(msg); bot_state.log(msg, "warning")
-                        st = _get_squad_restart(gid)
-                        async with st["lock"]:
-                            if not st["restarting"]:
-                                st["restarting"] = True
-                                asyncio.create_task(_schedule_squad_restart(gid))
+                        async with _restart_state["lock"]:
+                            _restart_state["restarting"] = True
+                        await _schedule_restart(); return
             if not _all_bots_are_online_or_searching():
                 async with _no_match_state["lock"]:
                     _no_match_state["global_last_match"] = time.time()
@@ -808,15 +752,11 @@ async def _no_match_watchdog():
                 async with _no_match_state["lock"]:
                     if _no_match_state["restart_triggered"]: continue
                     _no_match_state["restart_triggered"] = True
-                msg = f"[NO-MATCH] No match for {elapsed:.0f}s → restart stuck squads!"
+                msg = f"[NO-MATCH] No match for {elapsed:.0f}s → restart!"
                 print_warning(msg); bot_state.log(msg, "warning")
-                for gid in list(_teams_state.keys()):
-                    st = _get_squad_restart(gid)
-                    async with st["lock"]:
-                        if not st["restarting"]:
-                            st["restarting"] = True
-                            asyncio.create_task(_schedule_squad_restart(gid))
-                return
+                async with _restart_state["lock"]:
+                    _restart_state["restarting"] = True
+                await _schedule_restart(); return
         except Exception as e:
             print_warning(f"[NO-MATCH] error: {e}")
 
@@ -1551,7 +1491,6 @@ async def auto_move_loop(sock, ip, port, key_bytes, mask, state, stop_event, lab
         pass
 
     pos = list(state.server_pos)
-    spawn_pos = tuple(pos)
     seen_seq = state.server_update_seq
     heading = random.uniform(-math.pi, math.pi)
     stick = (math.sin(heading) * 100, 0.0, math.cos(heading) * 100)
@@ -1573,12 +1512,9 @@ async def auto_move_loop(sock, ip, port, key_bytes, mask, state, stop_event, lab
     last_glory_ping    = 0.0
     last_action_beacon = 0.0
     last_pos_hb        = 0.0
+    last_pose_cycle    = 0.0
 
-    # Custom Cycle & Legacy Cycle State
-    custom_total_sec = sum(max(0.05, float(d)) for _, d in CUSTOM_CYCLE_STEPS) or 1.0
-    last_custom_idx  = -1
-    rot_dir          = 1
-
+    # Cycle State: 5s straight run -> 15s circle/normal move
     cycle_len   = STRAIGHT_RUN_SEC + CIRCLE_MOVE_SEC
     cycle_start = time.time()
     last_phase  = None
@@ -1587,8 +1523,7 @@ async def auto_move_loop(sock, ip, port, key_bytes, mask, state, stop_event, lab
 
     while not stop_event.is_set():
         now = time.time()
-        dt_sec = min(0.25, max(0.001, now - last_send))
-        dt_ms = dt_sec * 1000.0
+        dt_ms = (now - last_send) * 1000.0
         last_send = now
 
         if state.server_update_seq != seen_seq and state.server_pos:
@@ -1597,253 +1532,163 @@ async def auto_move_loop(sock, ip, port, key_bytes, mask, state, stop_event, lab
             if math.hypot(sx - pos[0], sz - pos[2]) > AUTO_MOVE_RESYNC_DISTANCE:
                 print_info(f"[MOVE]{label} server-resync -> {state.server_pos}")
                 pos = [sx, sy, sz]
-                spawn_pos = (sx, sy, sz)
                 cycle_start = now
                 last_phase = None
-                last_custom_idx = -1
+
+        # ── Cycle Phase Check (5s straight -> 15s circle/normal) ──
+        in_cycle = (now - cycle_start) % cycle_len
+        is_straight_phase = in_cycle < STRAIGHT_RUN_SEC
+        if is_straight_phase != last_phase:
+            last_phase = is_straight_phase
+            if is_straight_phase:
+                await _account_clear_target(my_uid)
+                print_info(f"[MOVE]{label} 🏃 Straight run ({STRAIGHT_RUN_SEC:.0f}s)")
+            else:
+                print_info(f"[MOVE]{label} 🔄 Circle/normal move ({CIRCLE_MOVE_SEC:.0f}s)")
 
         move_input = (0, 0)
         vel = (0, 0, 0)
         pose = 0
-        is_straight_phase = False
 
-        if CUSTOM_CYCLE_ENABLED and CUSTOM_CYCLE_STEPS:
-            # ══ CUSTOM MOVEMENT CYCLE ══
-            elapsed_in_cycle = (now - cycle_start) % custom_total_sec
-            acc_t = 0.0
-            step_idx = 0
-            step_name = CUSTOM_CYCLE_STEPS[0][0]
-            for idx_s, (s_name, s_dur) in enumerate(CUSTOM_CYCLE_STEPS):
-                acc_t += max(0.05, float(s_dur))
-                if elapsed_in_cycle < acc_t:
-                    step_idx = idx_s
-                    step_name = s_name
-                    break
-
-            if step_idx != last_custom_idx:
-                last_custom_idx = step_idx
-                if step_name == "rotate_screen":
-                    rot_dir = random.choice([-1, 1])
-                if CUSTOM_CYCLE_LOG_STEPS:
-                    print_info(f"[MOVE]{label} ▸ Step [{step_idx+1}/{len(CUSTOM_CYCLE_STEPS)}]: {step_name}")
-
-            # ম্যাপের বাইরে চলে গেলে ধীরে ভেতরের দিকে ঘুরিয়ে আনা
-            dist_from_spawn = math.hypot(pos[0] - spawn_pos[0], pos[2] - spawn_pos[2])
-            if dist_from_spawn > AUTO_MOVE_RADIUS * 0.85 and step_name != "rotate_screen":
-                to_center = math.atan2(spawn_pos[0] - pos[0], spawn_pos[2] - pos[2])
-                diff = (to_center - heading + math.pi) % (2 * math.pi) - math.pi
-                heading += max(-math.radians(20), min(math.radians(20), diff))
-
-            if step_name.startswith("run") or step_name == "sprint":
-                speed = AUTO_MOVE_RUN_SPEED
-                step = speed * dt_ms / 100.0
-                ux, uz = math.sin(heading), math.cos(heading)
-                stick = (ux * 100, 0.0, uz * 100)
-                move_input = (stick[0], stick[2])
-                vel = (ux * speed, 0, uz * speed)
-                pose = MOVE_STATE_MAP.get("sprint" if step_name == "sprint" else "run", 2)
-                pos[0] += ux * step
-                pos[2] += uz * step
-
-            elif step_name == "crouch_walk":
-                speed = CROUCH_WALK_SPEED
-                step = speed * dt_ms / 100.0
-                ux, uz = math.sin(heading), math.cos(heading)
-                stick = (ux * 100, 0.0, uz * 100)
-                move_input = (stick[0], stick[2])
-                vel = (ux * speed, 0, uz * speed)
-                pose = PLAYER_STATE_MAP.get("crouch", 3)
-                pos[0] += ux * step
-                pos[2] += uz * step
-
-            elif step_name == "walk":
-                speed = AUTO_MOVE_WALK_SPEED
-                step = speed * dt_ms / 100.0
-                ux, uz = math.sin(heading), math.cos(heading)
-                stick = (ux * 100, 0.0, uz * 100)
-                move_input = (stick[0], stick[2])
-                vel = (ux * speed, 0, uz * speed)
-                pose = MOVE_STATE_MAP.get("walk", 1)
-                pos[0] += ux * step
-                pos[2] += uz * step
-
-            elif step_name == "jump":
-                speed = JUMP_MOVE_SPEED
-                step = speed * dt_ms / 100.0
-                ux, uz = math.sin(heading), math.cos(heading)
-                stick = (ux * 100, 0.0, uz * 100)
-                move_input = (stick[0], stick[2])
-                vel = (ux * speed, 0, uz * speed)
-                pose = PLAYER_STATE_MAP.get("jump", 2)
-                pos[0] += ux * step
-                pos[2] += uz * step
-
-            elif step_name == "rotate_screen":
-                heading += rot_dir * math.radians(SCREEN_ROTATE_DEG_PER_SEC) * dt_sec
-                heading = (heading + math.pi) % (2 * math.pi) - math.pi
-                stick = (0.0, 0.0, 0.0)
-                move_input = (0, 0)
-                vel = (0, 0, 0)
-                pose = PLAYER_STATE_MAP.get("idle", 0)
-
-            else:  # idle / fallback
-                stick = (0.0, 0.0, 0.0)
-                move_input = (0, 0)
-                vel = (0, 0, 0)
-                pose = PLAYER_STATE_MAP.get("idle", 0)
-
+        if is_straight_phase:
+            # ══ PHASE 1 (5s): শুধু সামনের দিকে সোজা দৌড়াবে, অন্য কিছু করবে না ══
+            speed = AUTO_MOVE_RUN_SPEED
+            step = speed * dt_ms / 100.0
+            ux, uz = math.sin(heading), math.cos(heading)
+            stick = (ux * 100, 0.0, uz * 100)
+            move_input = (stick[0], stick[2])
+            vel = (ux * speed, 0, uz * speed)
+            pose = MOVE_STATE_MAP.get("run", 2)
+            pos[0] += ux * step
+            pos[2] += uz * step
             last_pos = tuple(pos)
             stuck_timer = 0.0
-
         else:
-            # ── Legacy Cycle Phase Check (5s straight -> 15s circle/normal) ──
-            in_cycle = (now - cycle_start) % cycle_len
-            is_straight_phase = in_cycle < STRAIGHT_RUN_SEC
-            if is_straight_phase != last_phase:
-                last_phase = is_straight_phase
-                if is_straight_phase:
-                    await _account_clear_target(my_uid)
-                    print_info(f"[MOVE]{label} 🏃 Straight run ({STRAIGHT_RUN_SEC:.0f}s)")
-                else:
-                    print_info(f"[MOVE]{label} 🔄 Circle/normal move ({CIRCLE_MOVE_SEC:.0f}s)")
-
-            if is_straight_phase:
-                speed = AUTO_MOVE_RUN_SPEED
-                step = speed * dt_ms / 100.0
-                ux, uz = math.sin(heading), math.cos(heading)
-                stick = (ux * 100, 0.0, uz * 100)
-                move_input = (stick[0], stick[2])
-                vel = (ux * speed, 0, uz * speed)
-                pose = MOVE_STATE_MAP.get("run", 2)
-                pos[0] += ux * step
-                pos[2] += uz * step
-                last_pos = tuple(pos)
-                stuck_timer = 0.0
+            # ══ PHASE 2 (15s): বর্তমান মুভমেন্ট / সার্কেল ══
+            moved = math.hypot(pos[0] - last_pos[0], pos[2] - last_pos[2])
+            if moved < 4.0:
+                stuck_timer += AUTO_MOVE_TICK_INTERVAL
             else:
-                moved = math.hypot(pos[0] - last_pos[0], pos[2] - last_pos[2])
-                if moved < 4.0:
-                    stuck_timer += AUTO_MOVE_TICK_INTERVAL
+                if stuck_timer > STUCK_THRESHOLD:
+                    print_success(f"[STUCK]{label} escaped after {stuck_timer:.1f}s")
+                    stuck_events += 1
+                stuck_timer = 0.0
+                last_pos = tuple(pos)
+            if stuck_timer > STUCK_THRESHOLD and (now - last_stuck_log) > STUCK_LOG_COOLDOWN:
+                last_stuck_log = now
+                my_target = await _account_get_target(my_uid)
+                print_warning(
+                    f"[STUCK]{label} STUCK {stuck_timer:.1f}s @ {[round(x) for x in pos]} "
+                    f"| slot={state.slot} physx={state.server_physx_state} velY={state.server_vel_y} "
+                    f"| target={my_target[0]} | stuck={stuck_events}")
+
+            my_target, my_target_set_at = await _account_get_target(my_uid)
+            target_age = (now - my_target_set_at) if my_target else 999
+
+            nearest = await _account_nearest_enemy(my_uid, pos)
+            if nearest is not None:
+                my_target = nearest
+                if target_age > 1.5:
+                    print_info(f"[SQUAD]{label} enemy-lock {[round(x) for x in nearest]}")
+
+            if my_target is None or (target_age > SQUAD_TARGET_TIMEOUT and nearest is None):
+                ang = random.uniform(-math.pi, math.pi)
+                dist = random.uniform(1200, AUTO_MOVE_RADIUS)
+                new_t = (pos[0] + math.sin(ang) * dist, pos[1],
+                         pos[2] + math.cos(ang) * dist)
+                await _account_set_target(my_uid, new_t)
+                my_target = new_t
+                print_info(f"[SQUAD]{label} new target {[round(x) for x in new_t]}")
+
+            if ENABLE_SPEED_MOVEMENT and (now - cur_speed_update) >= MOVEMENT_UPDATE_SPEED_EVERY:
+                cur_speed_update = now
+                speed_mult = random.uniform(MOVEMENT_SPEED_MIN, MOVEMENT_SPEED_MAX)
+
+            if now >= afk_decision_at:
+                afk_decision_at = now + ANTI_AFK_DECISION_SEC
+                weights = [
+                    ("idle",   MOVEMENT_STATE_IDLE_CHANCE),
+                    ("walk",   MOVEMENT_STATE_WALK_CHANCE),
+                    ("run",    MOVEMENT_STATE_RUN_CHANCE),
+                    ("sprint", MOVEMENT_STATE_SPRINT_CHANCE),
+                    ("jump",   MOVEMENT_STATE_JUMP_CHANCE),
+                    ("crouch", MOVEMENT_STATE_CROUCH_CHANCE),
+                    ("prone",  MOVEMENT_STATE_PRONE_CHANCE),
+                ]
+                total_w = sum(w for _, w in weights)
+                r = random.uniform(0, total_w)
+                acc = 0.0
+                cur_state = "run"
+                for name, w in weights:
+                    acc += w
+                    if r <= acc:
+                        cur_state = name
+                        break
+                if random.random() < ANTI_AFK_IDLE_CHANCE:
+                    heading += random.uniform(-math.pi, math.pi)
+                    stick = (math.sin(heading) * 100, 0.0, math.cos(heading) * 100)
+
+            chasing = False
+
+            if my_target is not None:
+                dx = my_target[0] - pos[0]; dz = my_target[2] - pos[2]
+                remain = math.hypot(dx, dz)
+                if remain < SQUAD_ARRIVAL_RADIUS:
+                    await _account_clear_target(my_uid, only_if=my_target)
+                    my_target = None
                 else:
-                    if stuck_timer > STUCK_THRESHOLD:
-                        print_success(f"[STUCK]{label} escaped after {stuck_timer:.1f}s")
-                        stuck_events += 1
-                    stuck_timer = 0.0
-                    last_pos = tuple(pos)
-                if stuck_timer > STUCK_THRESHOLD and (now - last_stuck_log) > STUCK_LOG_COOLDOWN:
-                    last_stuck_log = now
-                    my_target = await _account_get_target(my_uid)
-                    print_warning(
-                        f"[STUCK]{label} STUCK {stuck_timer:.1f}s @ {[round(x) for x in pos]} "
-                        f"| slot={state.slot} physx={state.server_physx_state} velY={state.server_vel_y} "
-                        f"| target={my_target[0]} | stuck={stuck_events}")
+                    chasing = True
+                    speed = AUTO_MOVE_RUN_SPEED * speed_mult
+                    step = speed * dt_ms / 100.0
+                    want = math.atan2(dx, dz)
+                    diff = (want - heading + math.pi) % (2 * math.pi) - math.pi
+                    max_turn = math.radians(AUTO_MOVE_TURN_PER_TICK)
+                    heading += max(-max_turn, min(max_turn, diff))
+                    ux, uz = math.sin(heading), math.cos(heading)
+                    stick = (ux * 100, 0.0, uz * 100)
+                    move_input = (stick[0], stick[2])
+                    vel = (ux * speed, 0, uz * speed)
+                    pose = MOVE_STATE_MAP.get("run", 2)
+                    pos[0] += ux * step
+                    pos[2] += uz * step
 
-                my_target, my_target_set_at = await _account_get_target(my_uid)
-                target_age = (now - my_target_set_at) if my_target else 999
-
-                nearest = await _account_nearest_enemy(my_uid, pos)
-                if nearest is not None:
-                    my_target = nearest
-                    if target_age > 1.5:
-                        print_info(f"[SQUAD]{label} enemy-lock {[round(x) for x in nearest]}")
-
-                if my_target is None or (target_age > SQUAD_TARGET_TIMEOUT and nearest is None):
-                    ang = random.uniform(-math.pi, math.pi)
-                    dist = random.uniform(1200, AUTO_MOVE_RADIUS)
-                    new_t = (pos[0] + math.sin(ang) * dist, pos[1],
-                             pos[2] + math.cos(ang) * dist)
-                    await _account_set_target(my_uid, new_t)
-                    my_target = new_t
-                    print_info(f"[SQUAD]{label} new target {[round(x) for x in new_t]}")
-
-                if ENABLE_SPEED_MOVEMENT and (now - cur_speed_update) >= MOVEMENT_UPDATE_SPEED_EVERY:
-                    cur_speed_update = now
-                    speed_mult = random.uniform(MOVEMENT_SPEED_MIN, MOVEMENT_SPEED_MAX)
-
-                if now >= afk_decision_at:
-                    afk_decision_at = now + ANTI_AFK_DECISION_SEC
-                    weights = [
-                        ("idle",   MOVEMENT_STATE_IDLE_CHANCE),
-                        ("walk",   MOVEMENT_STATE_WALK_CHANCE),
-                        ("run",    MOVEMENT_STATE_RUN_CHANCE),
-                        ("sprint", MOVEMENT_STATE_SPRINT_CHANCE),
-                        ("jump",   MOVEMENT_STATE_JUMP_CHANCE),
-                        ("crouch", MOVEMENT_STATE_CROUCH_CHANCE),
-                        ("prone",  MOVEMENT_STATE_PRONE_CHANCE),
-                    ]
-                    total_w = sum(w for _, w in weights)
-                    r = random.uniform(0, total_w)
-                    acc = 0.0
-                    cur_state = "run"
-                    for name, w in weights:
-                        acc += w
-                        if r <= acc:
-                            cur_state = name
-                            break
-                    if random.random() < ANTI_AFK_IDLE_CHANCE:
-                        heading += random.uniform(-math.pi, math.pi)
-                        stick = (math.sin(heading) * 100, 0.0, math.cos(heading) * 100)
-
-                chasing = False
-
-                if my_target is not None:
-                    dx = my_target[0] - pos[0]; dz = my_target[2] - pos[2]
-                    remain = math.hypot(dx, dz)
-                    if remain < SQUAD_ARRIVAL_RADIUS:
-                        await _account_clear_target(my_uid, only_if=my_target)
-                        my_target = None
+            if not chasing:
+                if cur_state == "idle":
+                    move_input = (0, 0)
+                    vel = (0, 0, 0)
+                    pose = PLAYER_STATE_MAP["idle"]
+                else:
+                    if MOVEMENT_PATTERN == "circle":
+                        circle_angle += circle_dir * (MOVEMENT_TICK_MS / 1000.0) * 1.2
+                        radius = MOVEMENT_RADIUS
+                        wander_x = pos[0] + math.sin(circle_angle) * radius
+                        wander_z = pos[2] + math.cos(circle_angle) * radius
                     else:
-                        chasing = True
-                        speed = AUTO_MOVE_RUN_SPEED * speed_mult
-                        step = speed * dt_ms / 100.0
-                        want = math.atan2(dx, dz)
-                        diff = (want - heading + math.pi) % (2 * math.pi) - math.pi
-                        max_turn = math.radians(AUTO_MOVE_TURN_PER_TICK)
-                        heading += max(-max_turn, min(max_turn, diff))
-                        ux, uz = math.sin(heading), math.cos(heading)
-                        stick = (ux * 100, 0.0, uz * 100)
-                        move_input = (stick[0], stick[2])
-                        vel = (ux * speed, 0, uz * speed)
-                        pose = MOVE_STATE_MAP.get("run", 2)
-                        pos[0] += ux * step
-                        pos[2] += uz * step
+                        if random.random() < 0.05:
+                            heading += random.uniform(-math.pi / 3, math.pi / 3)
+                        wander_x = pos[0] + math.sin(heading) * MOVEMENT_RADIUS
+                        wander_z = pos[2] + math.cos(heading) * MOVEMENT_RADIUS
 
-                if not chasing:
-                    if cur_state == "idle":
-                        move_input = (0, 0)
-                        vel = (0, 0, 0)
-                        pose = PLAYER_STATE_MAP["idle"]
-                    else:
-                        if MOVEMENT_PATTERN == "circle":
-                            circle_angle += circle_dir * (MOVEMENT_TICK_MS / 1000.0) * 1.2
-                            radius = MOVEMENT_RADIUS
-                            wander_x = pos[0] + math.sin(circle_angle) * radius
-                            wander_z = pos[2] + math.cos(circle_angle) * radius
-                        else:
-                            if random.random() < 0.05:
-                                heading += random.uniform(-math.pi / 3, math.pi / 3)
-                            wander_x = pos[0] + math.sin(heading) * MOVEMENT_RADIUS
-                            wander_z = pos[2] + math.cos(heading) * MOVEMENT_RADIUS
+                    dx = wander_x - pos[0]; dz = wander_z - pos[2]
+                    if abs(dx) + abs(dz) < 1.0:
+                        dx, dz = math.sin(heading), math.cos(heading)
+                    want = math.atan2(dx, dz)
+                    diff = (want - heading + math.pi) % (2 * math.pi) - math.pi
+                    heading += max(-math.radians(15), min(math.radians(15), diff))
+                    ux, uz = math.sin(heading), math.cos(heading)
 
-                        dx = wander_x - pos[0]; dz = wander_z - pos[2]
-                        if abs(dx) + abs(dz) < 1.0:
-                            dx, dz = math.sin(heading), math.cos(heading)
-                        want = math.atan2(dx, dz)
-                        diff = (want - heading + math.pi) % (2 * math.pi) - math.pi
-                        heading += max(-math.radians(15), min(math.radians(15), diff))
-                        ux, uz = math.sin(heading), math.cos(heading)
+                    speed = STATE_SPEED.get(cur_state, 70) * speed_mult
+                    step = speed * dt_ms / 100.0
+                    stick = (ux * 100, 0.0, uz * 100)
+                    move_input = (stick[0], stick[2])
+                    vel = (ux * speed, 0, uz * speed)
+                    pose = MOVE_STATE_MAP.get(cur_state, 1)
+                    pos[0] += ux * step
+                    pos[2] += uz * step
 
-                        speed = STATE_SPEED.get(cur_state, 70) * speed_mult
-                        step = speed * dt_ms / 100.0
-                        stick = (ux * 100, 0.0, uz * 100)
-                        move_input = (stick[0], stick[2])
-                        vel = (ux * speed, 0, uz * speed)
-                        pose = MOVE_STATE_MAP.get(cur_state, 1)
-                        pos[0] += ux * step
-                        pos[2] += uz * step
-
-                    if now >= afk_jump_at:
-                        afk_jump_at = now + ANTI_AFK_JUMP_EVERY
-                        pose = PLAYER_STATE_MAP["jump"]
+                if now >= afk_jump_at:
+                    afk_jump_at = now + ANTI_AFK_JUMP_EVERY
+                    pose = PLAYER_STATE_MAP["jump"]
 
         facing = (math.sin(heading), 0.0, math.cos(heading))
         rtt = state.rtt_ms if state.rtt_ms is not None else AUTO_MOVE_DEFAULT_RTT
@@ -1860,8 +1705,8 @@ async def auto_move_loop(sock, ip, port, key_bytes, mask, state, stop_event, lab
         except Exception as e:
             print_warning(f"[MOVE]{label} send error: {e}")
 
-        # ★★★ GLORY BOOST PACKETS ★★★
-        if (CUSTOM_CYCLE_ENABLED or not is_straight_phase) and GLORY_BOOST_ENABLED:
+        # ★★★ GLORY BOOST PACKETS (শুধু ১৫ সেকেন্ডের ফেজে চলবে) ★★★
+        if (not is_straight_phase) and GLORY_BOOST_ENABLED:
             if now - last_glory_ping >= GLORY_PING_EVERY:
                 last_glory_ping = now
                 try:
@@ -1893,13 +1738,18 @@ async def auto_move_loop(sock, ip, port, key_bytes, mask, state, stop_event, lab
                 except Exception:
                     pass
 
-        if CUSTOM_CYCLE_ENABLED:
-            tick_wait = CUSTOM_CYCLE_TICK_INTERVAL
-        elif is_straight_phase:
-            tick_wait = AUTO_MOVE_TICK_INTERVAL
-        else:
-            tick_wait = GLORY_TICK_INTERVAL if GLORY_BOOST_ENABLED else AUTO_MOVE_TICK_INTERVAL
+            if now - last_pose_cycle >= 1.2:
+                last_pose_cycle = now
+                pose = random.choice([
+                    PLAYER_STATE_MAP["walk"],
+                    PLAYER_STATE_MAP["run"],
+                    PLAYER_STATE_MAP["sprint"],
+                    PLAYER_STATE_MAP["jump"],
+                ])
 
+        tick_wait = AUTO_MOVE_TICK_INTERVAL if is_straight_phase else (
+            GLORY_TICK_INTERVAL if GLORY_BOOST_ENABLED else AUTO_MOVE_TICK_INTERVAL
+        )
         if await wait(tick_wait):
             return
 
@@ -2288,74 +2138,74 @@ async def EncRypTMajoRLoGin(open_id: str, access_token: str, version: str) -> by
     fields = {
         3: str(datetime.now())[:-7],
         4: "free fire",
-        5: "1",
+        5: 1,
         7: str(version),
-        8: "Android OS 15 / API-35 (AP3A.240905.015.A2/OS2.0.202.0.VGTIDXM)",
+        8: "Android OS 11 / API-30 (RP1A.200720.011/230921V810)",
         9: "Handheld",
-        10: "Telkomsel",
-        11: "CarrierDataNetwork",
-        12: "1639",
-        13: "720",
-        14: "320",
+        10: "Grameenphone",
+        11: "WIFI",
+        12: 1708,
+        13: 750,
+        14: "480",
         15: "ARM64 FP ASIMD AES | 2000 | 8",
-        16: "5653",
+        16: 5767,
         17: "Mali-G52 MC2",
-        18: "OpenGL ES 3.2 v1.r49p1-03bet0.19498e0ae1d5dac223383c39a2e58f04",
+        18: "OpenGL ES 3.2 v1.r26p0-01eac0.f143e3f9482527bbad36b3ec27f93e59",
         19: "Google|3f10d414-be33-4ac3-b9fc-fcbf47c183b5",
-        20: "182.5.135.225",
+        20: "103.200.36.134",
         21: "en",
         22: str(open_id),
         23: "4",
         24: "Handheld",
-        25: "Xiaomi 2409BRN2CY",
-        26: "ID",
+        25: "INFINIX MOBILITY LIMITED Infinix X6812",
+        26: "BD",
         29: str(access_token),
-        30: "1",
-        41: "Telkomsel",
-        42: "4G",
+        30: 1,
+        41: "Grameenphone",
+        42: "WIFI",
         57: "7428b253defc164018c604a1ebbfebdf",
-        60: "109278",
-        61: "55402",
-        62: "868",
-        64: "55927",
-        65: "109278",
-        66: "55927",
-        67: "109278",
-        73: "2",
-        74: "/data/app/~~6Cw028g_ld-8Z0z2qhrOLA==/com.dts.freefireth-i3wiaEmpx8CbiRVhUMx_ag==/lib/arm64",
-        76: "1",
-        77: "b8e0cd5e295eee42f5860d3c86e483dd|/data/app/~~6Cw028g_ld-8Z0z2qhrOLA==/com.dts.freefireth-i3wiaEmpx8CbiRVhUMx_ag==/base.apk",
-        78: "3",
-        79: "2",
+        60: 110962,
+        61: 80611,
+        62: 1051,
+        64: 80829,
+        65: 110962,
+        66: 80829,
+        67: 110962,
+        73: 2,
+        74: "/data/app/~~MxBbX9YA6AkFscre_RExgw==/com.dts.freefireth-hLOkTeh1Q46L_oLV4UXQTg==/lib/arm64",
+        76: 1,
+        77: "b8e0cd5e295eee42f5860d3c86e483dd|/data/app/~~MxBbX9YA6AkFscre_RExgw==/com.dts.freefireth-hLOkTeh1Q46L_oLV4UXQTg==/base.apk",
+        78: 3,
+        79: 2,
         81: "64",
         83: "2019121229",
-        85: "3",
+        85: 3,
         86: "OpenGLES2",
-        87: "8191",
+        87: 4095,
         88: 4,
-        90: "Cirebon",
-        91: "JB",
-        92: "14466",
+        91: {
+            9: 65
+        },
+        92: 10508,
         93: "android",
-        94: "KqsHTyb7yHjsAiyNWUUZa0DSOD6U0AhDQ76smAo1WeHHHpSmJ8KMRyRrxb2ttgJqO9YOqO/K6AORAvDMAX/qBS8+JahIkrM7kHfzlfULbgRAoZ9r",
-        95: "111207",
-        96: '{"cur_rate":[60,90,120],"support_etc2":false}',
-        97: "1",
-        98: "1",
+        94: "KqsHT76RdsVKvnpkirzc2FQs3eu0OZChfZxMTZn+Rjv06Ri2qeOQkyPcdk5JceWKmXhOFFUPuNy9S8esTr37yCT5piY32iUcehVw0bL4F4lzAmyD",
+        95: 111207,
+        96: '{"cur_rate":[60,90],"support_etc2":false}',
+        97: 1,
         98: 1,
         99: "4",
-        102: "D]C\x15\x05T\x0eU3",
-        103: "1",
-        104: "52837",
-        105: "1",
-        106: "https://dl.gmc.freefiremobile.com/live/ABHotUpdates/|https://core-gmc.freefiremobile.com/live/ABHotUpdates/|211c933168f55902c7dfbfd8c4e2957d",
-        107: "1.3fb8adbf45f44ce9"
+        100: "4",
+        102: "B\\FFP[[\tf",
+        103: 1,
+        104: 28754,
+        105: 1,
+        106: "https://dl.ak.freefiremobile.com/live/ABHotUpdates/|https://core-ak.freefiremobile.com/live/ABHotUpdates/|a4332cb1c1a84e51dd77441e4856ed5a",
+        107: "1.477aa00e98bf924c",
     }
 
     proto_bytes = create_proto(fields)
     encrypted_hex = encrypt_aes(proto_bytes.hex())
     return bytes.fromhex(encrypted_hex)
-
 
 
 async def get_payload(access_token, open_id, platform, version, lang_code="en"):
@@ -2962,96 +2812,40 @@ _match_counter_lock = asyncio.Lock()
 # ==================== ACCOUNTS FILE LOCK ====================
 _accounts_file_lock = asyncio.Lock()
 
-async def _read_accounts_file_unlocked() -> list:
-    if not os.path.exists(ACCOUNTS_FILE):
-        return []
-    try:
-        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        print_warning(f"[ACCOUNTS] read {ACCOUNTS_FILE} failed: {e}")
-        return []
-
-async def _write_accounts_file_unlocked(accounts: list):
-    tmp = ACCOUNTS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(accounts, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, ACCOUNTS_FILE)
-
 async def _remove_from_accounts_file(identifiers: set) -> list:
+    """
+    Remove any entries in accounts.json whose `uid` matches any identifier.
+    Returns the list of removed entries. Safe to call concurrently.
+    """
     removed = []
     if not identifiers: return removed
     if not os.path.exists(ACCOUNTS_FILE): return removed
     async with _accounts_file_lock:
-        accs = await _read_accounts_file_unlocked()
-        if not accs: return removed
+        try:
+            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                accs = json.load(f)
+        except Exception as e:
+            print_warning(f"[DELETE] read {ACCOUNTS_FILE} failed: {e}")
+            return removed
+        if not isinstance(accs, list): return removed
         kept = []
         for a in accs:
             if not isinstance(a, dict):
                 kept.append(a); continue
             auid = str(a.get("uid", "")).strip()
-            atok = str(a.get("token", "")).strip()
-            if (auid and auid in identifiers) or (atok and (atok in identifiers or f"tok_{atok[:20]}" in identifiers)):
+            if auid and auid in identifiers:
                 removed.append(a)
             else:
                 kept.append(a)
         if removed:
             try:
-                await _write_accounts_file_unlocked(kept)
+                tmp = ACCOUNTS_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(kept, f, indent=2, ensure_ascii=False)
+                os.replace(tmp, ACCOUNTS_FILE)
             except Exception as e:
                 print_error(f"[DELETE] save {ACCOUNTS_FILE} failed: {e}")
     return removed
-
-async def _stop_and_cleanup_account(identifiers: set):
-    resolved = {str(x).strip() for x in identifiers if str(x).strip()}
-    for u in list(resolved):
-        v = bot_state.game_to_auth_id.get(u)
-        if v: resolved.add(str(v))
-        v2 = bot_state.auth_to_game_id.get(u)
-        if v2: resolved.add(str(v2))
-    for u in list(resolved):
-        acc = bot_state.accounts.get(u)
-        if acc and acc.get("auth_uid"):
-            resolved.add(str(acc["auth_uid"]))
-    for gid, gacc in list(bot_state.accounts.items()):
-        if str(gacc.get("auth_uid", "")) in resolved:
-            resolved.add(str(gid))
-    for u in list(resolved):
-        cached = cache_get(u)
-        if cached:
-            try:
-                if cached.get("account_id"): resolved.add(str(cached["account_id"]))
-                if cached.get("auth_uid"): resolved.add(str(cached["auth_uid"]))
-            except Exception: pass
-
-    for u in resolved:
-        if u in bot_state.account_workers:
-            try: bot_state.account_workers[u].cancel()
-            except Exception: pass
-            bot_state.account_workers.pop(u, None)
-
-    removed_memory = []
-    for u in resolved:
-        if u in bot_state.accounts:
-            removed_memory.append(u)
-            del bot_state.accounts[u]
-        bot_state.paused.discard(u)
-        bot_state.toggle_pause(u, False)
-        bot_state.account_credentials.pop(u, None)
-        bot_state.game_to_auth_id.pop(u, None)
-        bot_state.auth_to_game_id.pop(u, None)
-        try: cache_invalidate(u)
-        except Exception: pass
-        try: await _clear_team_joined(u)
-        except Exception: pass
-        for gid, t in list(_teams_state.items()):
-            if u in t["peers"]:
-                t["peers"].pop(u, None)
-                if t["leader_uid"] == u:
-                    t["leader_uid"] = None
-                    t["team_code"] = None
-    return resolved, removed_memory
     
 async def _inc_match(uid):
     async with _match_counter_lock:
@@ -3131,8 +2925,7 @@ def cache_invalidate(uid):
 
 # ==================== PLAY GAME ====================
 async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
-                    account_id, player_region, client_version, key, iv, match_index,
-                    squad_id="A"):
+                    account_id, player_region, client_version, key, iv, match_index):
     match_start_time = time.time()
     ping_task = None; sock = None
     ping_stop = asyncio.Event()
@@ -3288,19 +3081,19 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             try: await move_task
             except asyncio.CancelledError: pass
             except Exception: pass
-
+            
         if force_move_task:
             force_move_task.cancel()
             try: await force_move_task
             except asyncio.CancelledError: pass
             except Exception: pass
-
+            
         if completed_cleanly:
             try:
                 bot_state.increment_match(uid_str)
                 print_premium(f"Match #{match_index} Complete | UID: {uid_str}",
                               color=PX.GOLD, icon=I["crown"])
-                try: await _mark_bot_match_finished(uid_str, squad_id=squad_id)
+                try: await _mark_bot_match_finished(uid_str)
                 except Exception: pass
                 async def _post_exp(uid):
                     try:
@@ -3324,8 +3117,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
 
 # ==================== PLAY GAME (CS MODE) ====================
 async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
-                       account_id, player_region, client_version, key, iv, match_index,
-                       squad_id="A"):
+                       account_id, player_region, client_version, key, iv, match_index):
     match_start_time = time.time()
     ping_task = None; move_task = None; skill_task = None; force_move_task = None; sock = None
     ping_stop = asyncio.Event()
@@ -3391,7 +3183,7 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
                         move_task = asyncio.create_task(
                             auto_move_loop(sock, resolved_ip, port, udp_key_bytes, match_code,
                                            move_state, ping_stop, label=f"[{tag}]"))
-
+                    
                     if HOMER_SKILL_ENABLED and skill_task is None:
                         skill_task = asyncio.create_task(
                             homer_skill_loop(sock, resolved_ip, port, udp_key_bytes, match_code,
@@ -3409,6 +3201,8 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
                     frame = await decode_packet(response, udp_key_bytes, match_code)
                     if not frame:
                         move_state.undecoded += 1
+                        # Reliable packets we cannot decrypt still carry a readable order id: ack them,
+                        # otherwise the server resends them endlessly
                         oid = await peek_reliable_order(response, udp_key_bytes, match_code)
                         if oid is not None:
                             nxt = (oid + 1) & 0xFFFF
@@ -3442,6 +3236,7 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
                                 await loop.sock_sendto(sock, fin_ack, server_addr)
                             except Exception: pass
                             continue
+                        # Cumulative ACK (orderId + 1) for every reliable packet
                         if (flags & 1) and order_id is not None:
                             try:
                                 next_expected = (order_id + 1) & 0xFFFF
@@ -3506,7 +3301,7 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
             try:
                 bot_state.increment_match(uid_str)
                 print_premium(f"{tag} Complete", color=PX.GOLD, icon=I["crown"])
-                try: await _mark_bot_match_finished(uid_str, squad_id=squad_id)
+                try: await _mark_bot_match_finished(uid_str)
                 except Exception: pass
                 async def _post_exp(uid):
                     try:
@@ -3521,7 +3316,6 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
         except Exception: pass
 
 # ==================== FUNCTIONAL LONE WOLF ====================
-# ==================== FUNCTIONAL LONE WOLF ====================
 async def functional_lone_wolf(addrs, starter_packet, account_region, client_version,
                                 key, iv, account_id="", account_data=None, max_reconnects=10,
                                 squad_id="A"):
@@ -3534,8 +3328,6 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     uid_str = str(account_id)
     gid = str(squad_id or "A").upper()
     team_state = _get_team(gid)
-    squad_restart = _get_squad_restart(gid)
-    my_restart_seq = squad_restart["seq"]
 
     current_token = starter_packet
     current_key = key; current_iv = iv
@@ -3637,7 +3429,6 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     async def _team_coordinator():
         try:
             while True:
-                if squad_restart["seq"] != my_restart_seq: return
                 async with team_state["lock"]:
                     n = len(team_state["peers"])
                 if n >= TEAM_SIZE: break
@@ -3708,7 +3499,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                           color=PX.EMERALD, icon=I["rocket"])
             try: bot_state.update_status(uid_str, "SEARCHING", 0)
             except Exception: pass
-            while _team_active["flag"] and not _match_played["flag"] and squad_restart["seq"] == my_restart_seq:
+            while _team_active["flag"] and not _match_played["flag"]:
                 try:
                     if bot_state.is_paused(uid_str): break
                     async with team_state["lock"]:
@@ -3728,9 +3519,10 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                        f"(again after {CS_TEAM_START_RETRY:.0f}s without a match)")
                 except Exception as e: print_warning(f"TEAM[{gid}] start_match err: {e}")
                 if CS_MODE_ENABLED:
+                    # CS: repeating start restarts the search — wait for the match instead
                     retry_at = time.time() + CS_TEAM_START_RETRY
                     while (time.time() < retry_at and _team_active["flag"] and not _match_played["flag"]
-                           and squad_restart["seq"] == my_restart_seq and not bot_state.is_paused(uid_str)):
+                           and not bot_state.is_paused(uid_str)):
                         await asyncio.sleep(0.5)
                     continue
                 try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
@@ -3742,7 +3534,6 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     async def _member_match_trigger():
         try:
             await asyncio.sleep(TEAM_READY_DELAY + 18.0)
-            if squad_restart["seq"] != my_restart_seq: return
             async with team_state["lock"]:
                 if team_state["leader_uid"] == uid_str: return
             print_premium(f"TEAM[{gid}] Member {uid_str} ready loop",
@@ -3750,7 +3541,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
             try: bot_state.update_status(uid_str, "SEARCHING", 0)
             except Exception: pass
             my_id = current_account_data.get('account_id', uid_str) if current_account_data else uid_str
-            while _team_active["flag"] and not _match_played["flag"] and squad_restart["seq"] == my_restart_seq:
+            while _team_active["flag"] and not _match_played["flag"]:
                 try:
                     if bot_state.is_paused(uid_str): break
                     if _writer_ref["w"] and not _writer_ref["w"].is_closing():
@@ -3766,7 +3557,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 if CS_MODE_ENABLED:
                     retry_at = time.time() + CS_TEAM_START_RETRY
                     while (time.time() < retry_at and _team_active["flag"] and not _match_played["flag"]
-                           and squad_restart["seq"] == my_restart_seq and not bot_state.is_paused(uid_str)):
+                           and not bot_state.is_paused(uid_str)):
                         await asyncio.sleep(0.5)
                     continue
                 try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
@@ -3777,14 +3568,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
     try:
         while True:
-            if squad_restart["seq"] != my_restart_seq:
-                print_warning(f"[RESTART-{gid}] {uid_str} restarting for Squad {gid}")
-                try: bot_state.update_status(uid_str, "OFFLINE", 0)
-                except Exception: pass
-                return
             while bot_state.is_paused(uid_str):
-                if squad_restart["seq"] != my_restart_seq:
-                    return
                 try: bot_state.update_status(uid_str, "PAUSED", 0)
                 except Exception: pass
                 await asyncio.sleep(1.0)
@@ -3881,11 +3665,6 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 while True:
                     play_matches[:] = [m for m in play_matches if not m.done()]
                     if bot_state.is_paused(uid_str): break
-                    if squad_restart["seq"] != my_restart_seq:
-                        print_warning(f"[RESTART-{gid}] {uid_str} restarting for Squad {gid}")
-                        try: bot_state.update_status(uid_str, "OFFLINE", 0)
-                        except Exception: pass
-                        return
                     if _match_played["flag"]:
                         try: data = await asyncio.wait_for(reader.read(8192), timeout=1.0)
                         except asyncio.TimeoutError: continue
@@ -4007,7 +3786,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                     game_fn(server_ip_port, thunder, sharma, udp_key,
                                             match_code, effective_acc_id, "ID",
                                             client_version, current_key, current_iv,
-                                            match_index=match_index, squad_id=gid))
+                                            match_index=match_index))
                                 play_matches.append(new_match)
 
                                 async def drain_gw():
@@ -4683,20 +4462,15 @@ async def _autoload_accounts():
             if not isinstance(a, dict): continue
             uid = str(a.get("uid", "")).strip()
             password = str(a.get("password", "")).strip()
-            token = str(a.get("token", "")).strip()
             region = str(a.get("region", "")).strip() or None
             clan_id = str(a.get("clan_id", "")).strip() or CLAN_ID_DEFAULT
             squad_id = str(a.get("squad_id", "")).strip().upper() or _group_for_index(i)
-            if token and not (uid and password):
-                task = asyncio.create_task(account_loop_token(token, squad_id=squad_id))
-                bot_state.account_workers[f"tok_{token[:20]}"] = task
-                print_info(f"token worker ({i+1}/{len(accounts)}) squad={squad_id}")
-            elif uid and password:
-                task = asyncio.create_task(account_loop_guest(
-                    uid, password, region_override=region,
-                    clan_override=clan_id, squad_id=squad_id))
-                bot_state.account_workers[uid] = task
-                print_info(f"worker {uid} ({i+1}/{len(accounts)}) region={region} squad={squad_id}")
+            if not uid or not password: continue
+            task = asyncio.create_task(account_loop_guest(
+                uid, password, region_override=region,
+                clan_override=clan_id, squad_id=squad_id))
+            bot_state.account_workers[uid] = task
+            print_info(f"worker {uid} ({i+1}/{len(accounts)}) region={region} squad={squad_id}")
             await asyncio.sleep(0.5)
         except Exception as e:
             print_error(f"[BOOT] worker {i+1}: {e}")
@@ -4788,9 +4562,9 @@ async def api_stats(request):
             "team_code": first_team_code,
             "leader_uid": first_leader,
             "team_size": sum(len(t["peers"]) for t in _teams_state.values()),
-            "restart_finished": sum(len(s["finished_bots"]) for s in _squad_restart_states.values()),
-            "restart_target": sum((s["target"] or 0) for s in _squad_restart_states.values()) or None,
-            "restarting": any(s["restarting"] for s in _squad_restart_states.values()),
+            "restart_finished": len(_restart_state["finished_bots"]),
+            "restart_target": _restart_state["target"],
+            "restarting": _restart_state["restarting"],
         }
         return aiohttp.web.Response(text=json.dumps(data, default=str, ensure_ascii=False),
                                     content_type="application/json", charset="utf-8")
@@ -4849,32 +4623,18 @@ async def api_create_team(request):
 async def api_account_add(request):
     try:
         body = await request.json()
-        squad_id = str(body.get("squad_id", "") or _assign_squad_for_new_account()).strip().upper()
-        region = str(body.get("region", "BD") or "BD").strip().upper()
-        clan_id = str(body.get("clan_id", "") or CLAN_ID_DEFAULT).strip()
-
+        squad_id = _assign_squad_for_new_account()
         if body.get("token"):
             token = str(body["token"]).strip()
             if not token:
                 return aiohttp.web.json_response({"status": "error", "error": "empty token"})
-            async with _accounts_file_lock:
-                accs = await _read_accounts_file_unlocked()
-                if not any(isinstance(a, dict) and str(a.get("token", "")).strip() == token for a in accs):
-                    accs.append({"token": token, "region": region, "clan_id": clan_id, "squad_id": squad_id})
-                    await _write_accounts_file_unlocked(accs)
             asyncio.create_task(account_loop_token(token, squad_id=squad_id))
             return aiohttp.web.json_response({"status": "ok"})
-
         uid = str(body.get("uid", "")).strip()
         password = str(body.get("password", "")).strip()
         if not uid or not password:
             return aiohttp.web.json_response({"status": "error", "error": "uid/password required"})
-        async with _accounts_file_lock:
-            accs = await _read_accounts_file_unlocked()
-            if not any(isinstance(a, dict) and str(a.get("uid", "")).strip() == uid for a in accs):
-                accs.append({"uid": uid, "password": password, "region": region, "clan_id": clan_id, "squad_id": squad_id})
-                await _write_accounts_file_unlocked(accs)
-        asyncio.create_task(account_loop_guest(uid, password, region_override=region, clan_override=clan_id, squad_id=squad_id))
+        asyncio.create_task(account_loop_guest(uid, password, squad_id=squad_id))
         return aiohttp.web.json_response({"status": "ok"})
     except Exception as e:
         return aiohttp.web.json_response({"status": "error", "error": str(e)})
@@ -5050,275 +4810,55 @@ async def api_get_raw_accounts(request):
     except Exception as e:
         return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
 
-async def api_accounts_json_upsert(request):
-    try:
-        body = await request.json()
-        old_uid = str(body.get("old_uid", "") or "").strip()
-        old_index = body.get("old_index", None)
-        uid = str(body.get("uid", "") or "").strip()
-        password = str(body.get("password", "") or "").strip()
-        token = str(body.get("token", "") or "").strip()
-        region = str(body.get("region", "BD") or "BD").strip().upper()
-        clan_id = str(body.get("clan_id", CLAN_ID_DEFAULT) or CLAN_ID_DEFAULT).strip()
-        squad_id = str(body.get("squad_id", "") or _assign_squad_for_new_account()).strip().upper()
-        apply_live = bool(body.get("apply_live", True))
-
-        if token and not (uid and password):
-            new_entry = {"token": token, "region": region, "clan_id": clan_id, "squad_id": squad_id}
-        elif uid and password:
-            new_entry = {"uid": uid, "password": password, "region": region, "clan_id": clan_id, "squad_id": squad_id}
-        else:
-            return aiohttp.web.json_response({"ok": False, "error": "UID ও Password (অথবা Token) দিতে হবে"}, status=400)
-
-        async with _accounts_file_lock:
-            accs = await _read_accounts_file_unlocked()
-            is_edit = bool(old_uid) or (old_index is not None and isinstance(old_index, int) and 0 <= old_index < len(accs))
-            if is_edit:
-                target_idx = None
-                if old_uid:
-                    for i, a in enumerate(accs):
-                        if isinstance(a, dict) and str(a.get("uid", "")).strip() == old_uid:
-                            target_idx = i; break
-                if target_idx is None and old_index is not None and 0 <= old_index < len(accs):
-                    target_idx = old_index
-                if target_idx is None:
-                    return aiohttp.web.json_response({"ok": False, "error": "Account not found in accounts.json"}, status=404)
-                if uid:
-                    for i, a in enumerate(accs):
-                        if i != target_idx and isinstance(a, dict) and str(a.get("uid", "")).strip() == uid:
-                            return aiohttp.web.json_response({"ok": False, "error": f"UID {uid} already exists"}, status=400)
-                accs[target_idx] = new_entry
-            else:
-                if uid and any(isinstance(a, dict) and str(a.get("uid", "")).strip() == uid for a in accs):
-                    return aiohttp.web.json_response({"ok": False, "error": f"UID {uid} already exists"}, status=400)
-                accs.append(new_entry)
-            await _write_accounts_file_unlocked(accs)
-
-        if apply_live:
-            kill_ids = {x for x in (old_uid, uid) if x}
-            if token: kill_ids.add(f"tok_{token[:20]}")
-            await _stop_and_cleanup_account(kill_ids)
-            await asyncio.sleep(0.3)
-            if token and not (uid and password):
-                t = asyncio.create_task(account_loop_token(token, squad_id=squad_id))
-                bot_state.account_workers[f"tok_{token[:20]}"] = t
-            else:
-                t = asyncio.create_task(account_loop_guest(uid, password, region_override=region, clan_override=clan_id, squad_id=squad_id))
-                bot_state.account_workers[uid] = t
-
-        print_success(f"[ACCOUNTS-JSON] {'Updated' if is_edit else 'Added'} {uid or token[:12]} [Group {squad_id}]")
-        return aiohttp.web.json_response({"ok": True, "data": accs})
-    except Exception as e:
-        traceback.print_exc()
-        return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
-
-async def api_accounts_json_delete(request):
-    try:
-        body = await request.json()
-        uid = str(body.get("uid", "") or "").strip()
-        index = body.get("index", None)
-        stop_live = bool(body.get("stop_live", True))
-        removed_entry = None
-
-        async with _accounts_file_lock:
-            accs = await _read_accounts_file_unlocked()
-            if uid:
-                kept = []
-                for a in accs:
-                    if isinstance(a, dict) and str(a.get("uid", "")).strip() == uid and removed_entry is None:
-                        removed_entry = a
-                    else:
-                        kept.append(a)
-                accs = kept
-            elif index is not None and isinstance(index, int) and 0 <= index < len(accs):
-                removed_entry = accs.pop(index)
-            else:
-                return aiohttp.web.json_response({"ok": False, "error": "uid or valid index required"}, status=400)
-            await _write_accounts_file_unlocked(accs)
-
-        if stop_live and isinstance(removed_entry, dict):
-            kill_ids = set()
-            if removed_entry.get("uid"): kill_ids.add(str(removed_entry["uid"]).strip())
-            if removed_entry.get("token"):
-                tok = str(removed_entry["token"]).strip()
-                kill_ids.add(tok); kill_ids.add(f"tok_{tok[:20]}")
-            if kill_ids:
-                await _stop_and_cleanup_account(kill_ids)
-
-        print_warning(f"[ACCOUNTS-JSON] Deleted account {uid or index}")
-        return aiohttp.web.json_response({"ok": True, "data": accs})
-    except Exception as e:
-        traceback.print_exc()
-        return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
-
-async def api_save_raw_accounts(request):
-    try:
-        body = await request.json()
-        raw_data = body.get("data")
-        sync_live = bool(body.get("sync_live", False))
-        if not isinstance(raw_data, list):
-            return aiohttp.web.json_response({"ok": False, "error": "JSON must be an array [...]"}, status=400)
-
-        cleaned = []
-        seen_uids = set()
-        seen_tokens = set()
-        for idx, item in enumerate(raw_data):
-            if not isinstance(item, dict):
-                return aiohttp.web.json_response({"ok": False, "error": f"Item #{idx+1} must be an object {{...}}"}, status=400)
-            uid = str(item.get("uid", "") or "").strip()
-            password = str(item.get("password", "") or "").strip()
-            token = str(item.get("token", "") or "").strip()
-            if not token and not (uid and password):
-                return aiohttp.web.json_response({"ok": False, "error": f"Item #{idx+1} requires uid+password or token"}, status=400)
-
-            if uid and password:
-                if uid in seen_uids:
-                    return aiohttp.web.json_response({"ok": False, "error": f"Duplicate UID: {uid}"}, status=400)
-                seen_uids.add(uid)
-            elif token:
-                if token in seen_tokens:
-                    return aiohttp.web.json_response({"ok": False, "error": f"Duplicate Token at item #{idx+1}"}, status=400)
-                seen_tokens.add(token)
-
-            entry = dict(item)
-            if uid: entry["uid"] = uid
-            if password: entry["password"] = password
-            if token: entry["token"] = token
-            entry["region"] = str(item.get("region", "BD") or "BD").strip().upper()
-            entry["clan_id"] = str(item.get("clan_id", CLAN_ID_DEFAULT) or CLAN_ID_DEFAULT).strip()
-            entry["squad_id"] = str(item.get("squad_id", _group_for_index(idx)) or _group_for_index(idx)).strip().upper()
-            cleaned.append(entry)
-
-        async with _accounts_file_lock:
-            old_accs = await _read_accounts_file_unlocked()
-            await _write_accounts_file_unlocked(cleaned)
-
-        if sync_live:
-            def _key(a):
-                if a.get("uid") and a.get("password"): return f"uid:{str(a['uid']).strip()}"
-                if a.get("token"): return f"tok:{str(a['token']).strip()}"
-                return None
-
-            old_map = {_key(a): a for a in old_accs if isinstance(a, dict) and _key(a)}
-            new_map = {_key(a): a for a in cleaned if _key(a)}
-
-            # রিমুভ হওয়া অ্যাকাউন্ট বন্ধ করা
-            for k, old_a in old_map.items():
-                if k not in new_map:
-                    kill_ids = set()
-                    if old_a.get("uid"): kill_ids.add(str(old_a["uid"]).strip())
-                    if old_a.get("token"):
-                        tok = str(old_a["token"]).strip()
-                        kill_ids.update({tok, f"tok_{tok[:20]}"})
-                    await _stop_and_cleanup_account(kill_ids)
-
-            # নতুন বা পরিবর্তিত অ্যাকাউন্ট চালু/রিস্টার্ট করা
-            for k, new_a in new_map.items():
-                old_a = old_map.get(k)
-                changed = (old_a is None) or any(
-                    str(old_a.get(f, "")) != str(new_a.get(f, ""))
-                    for f in ("password", "token", "region", "clan_id", "squad_id")
-                )
-                u = new_a.get("uid")
-                tok = new_a.get("token")
-                worker_key = u if (u and new_a.get("password")) else f"tok_{tok[:20]}"
-
-                if changed or worker_key not in bot_state.account_workers:
-                    if old_a is not None:
-                        kill_ids = set()
-                        if u: kill_ids.add(u)
-                        if tok: kill_ids.update({tok, f"tok_{tok[:20]}"})
-                        await _stop_and_cleanup_account(kill_ids)
-                        await asyncio.sleep(0.1)
-
-                    if u and new_a.get("password"):
-                        t = asyncio.create_task(account_loop_guest(
-                            u, new_a["password"],
-                            region_override=new_a["region"],
-                            clan_override=new_a["clan_id"],
-                            squad_id=new_a["squad_id"]
-                        ))
-                        bot_state.account_workers[u] = t
-                    elif tok:
-                        t = asyncio.create_task(account_loop_token(tok, squad_id=new_a["squad_id"]))
-                        bot_state.account_workers[f"tok_{tok[:20]}"] = t
-
-        print_success(f"[ACCOUNTS-JSON] Saved {len(cleaned)} account(s) (sync_live={sync_live})")
-        return aiohttp.web.json_response({"ok": True, "data": cleaned})
-    except Exception as e:
-        traceback.print_exc()
-        return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
-
 async def account_loop_token(token, squad_id="A"):
-    squad = str(squad_id or "A").upper()
-    tok_key = f"tok_{token[:20]}"
-    bot_state.account_workers[tok_key] = asyncio.current_task()
-    acc_id_raw = None
-    while True:
-        try:
-            print_info(f"TOKEN Login {token[:20]}... (squad={squad})")
-            vc = await version_config("ID")
-            if not vc:
-                await asyncio.sleep(15); continue
-            release_version, client_version, server_url, gop_1, app_version = vc
-            url = f"https://100067.connect.garena.com/oauth/token/inspect?token={token}"
-            hdrs = {"User-Agent":"GarenaMSDK/4.0.19P4(G011A ;Android 9;en;US;)"}
-            r = await client.get(url, headers=hdrs)
-            if r.status_code != 200:
-                await asyncio.sleep(15); continue
-            data = r.json()
-            if 'error' in data:
-                await asyncio.sleep(15); continue
-            open_id = data.get('open_id'); platform = data.get('platform', 4)
-            if not open_id:
-                await asyncio.sleep(15); continue
-            major_payload, login_payload = await get_payload(
-                token, open_id, platform, client_version)
-            res_json = await major_login(major_payload, server_url, release_version)
-            if not res_json:
-                await asyncio.sleep(15); continue
-            def _gd(k):
-                v = res_json.get(str(k))
-                if isinstance(v, dict) and "data" in v: return v["data"]
-                return v
-            acc_id_raw = _gd(1); jwt_token = _gd(8)
-            server_url_raw = _gd(10); server_time = _gd(21)
-            region_raw = _gd(2) or "ID"
-            aes_ak, iv_i = _extract_key_iv(res_json)
-            if not (jwt_token and server_url_raw and aes_ak):
-                await asyncio.sleep(15); continue
-            ld = await get_login_data(login_payload, jwt_token, server_url_raw, release_version)
-            def _gf(f, d=None):
-                v = (ld or {}).get(str(f), {}).get("data")
-                return v if v is not None else d
-            level = int(_gf(6,1) or 1); exp = int(_gf(7,0) or 0)
-            nickname = _gf(4, f"Player_{acc_id_raw}") or f"Player_{acc_id_raw}"
-            ad = {'account_id':acc_id_raw,'nickname':nickname,'region':region_raw,
-                'level':level,'exp':exp,'likes':int(_gf(8,0) or 0),
-                'open_id':open_id,'access_token':token,'platform':str(platform),
-                'token':jwt_token,'server_time':server_time,
-                'aes_ak':aes_ak,'iv_i':iv_i,
-                'functional_addrs':_gf_field(ld, 14),
-                'informational_addrs':_gf_field(ld, 32),
-                'release_version':release_version,'client_version':client_version,
-                'server_url':server_url_raw,'login_payload_data':login_payload,
-                'auth_type':'token','auth_token':token,
-                'squad_id': squad}
-            _register_credentials(ad)
-            cache_set(tok_key, ad)
-            bot_state.account_workers[str(acc_id_raw)] = asyncio.current_task()
-            await run_account_worker(ad, str(acc_id_raw), squad_id=squad)
-            await asyncio.sleep(3)
-        except asyncio.CancelledError:
-            try:
-                if acc_id_raw:
-                    bot_state.update_status(str(acc_id_raw), "OFFLINE")
-                    await _clear_team_joined(str(acc_id_raw))
-            except Exception: pass
-            break
-        except Exception as e:
-            print_error(f"TOKEN {e}")
-            await asyncio.sleep(10)
+    print_info(f"TOKEN Login {token[:20]}... (squad={squad_id})")
+    try:
+        vc = await version_config("ID")
+        if not vc: return
+        release_version, client_version, server_url, gop_1, app_version = vc
+        url = f"https://100067.connect.garena.com/oauth/token/inspect?token={token}"
+        hdrs = {"User-Agent":"GarenaMSDK/4.0.19P4(G011A ;Android 9;en;US;)"}
+        r = await client.get(url, headers=hdrs)
+        if r.status_code != 200: return
+        data = r.json()
+        if 'error' in data: return
+        open_id = data.get('open_id'); platform = data.get('platform', 4)
+        if not open_id: return
+        major_payload, login_payload = await get_payload(
+            token, open_id, platform, client_version)
+        res_json = await major_login(major_payload, server_url, release_version)
+        if not res_json: return
+        def _gd(k):
+            v = res_json.get(str(k))
+            if isinstance(v, dict) and "data" in v: return v["data"]
+            return v
+        acc_id_raw = _gd(1); jwt_token = _gd(8)
+        server_url_raw = _gd(10); server_time = _gd(21)
+        region_raw = _gd(2) or "ID"
+        aes_ak, iv_i = _extract_key_iv(res_json)
+        if not (jwt_token and server_url_raw and aes_ak): return
+        ld = await get_login_data(login_payload, jwt_token, server_url_raw, release_version)
+        def _gf(f, d=None):
+            v = (ld or {}).get(str(f), {}).get("data")
+            return v if v is not None else d
+        level = int(_gf(6,1) or 1); exp = int(_gf(7,0) or 0)
+        nickname = _gf(4, f"Player_{acc_id_raw}") or f"Player_{acc_id_raw}"
+        ad = {'account_id':acc_id_raw,'nickname':nickname,'region':region_raw,
+            'level':level,'exp':exp,'likes':int(_gf(8,0) or 0),
+            'open_id':open_id,'access_token':token,'platform':str(platform),
+            'token':jwt_token,'server_time':server_time,
+            'aes_ak':aes_ak,'iv_i':iv_i,
+            'functional_addrs':_gf_field(ld, 14),
+            'informational_addrs':_gf_field(ld, 32),
+            'release_version':release_version,'client_version':client_version,
+            'server_url':server_url_raw,'login_payload_data':login_payload,
+            'auth_type':'token','auth_token':token,
+            'squad_id': str(squad_id or "A").upper()}
+        _register_credentials(ad)
+        cache_set(f"tok_{token[:20]}", ad)
+        await run_account_worker(ad, str(acc_id_raw), squad_id=squad_id)
+    except Exception as e:
+        print_error(f"TOKEN {e}")
 
 async def start_web_server():
     app = aiohttp.web.Application(middlewares=[_req_logger])
@@ -5335,9 +4875,6 @@ async def start_web_server():
     app.router.add_post("/api/account/pause", api_account_pause)
     app.router.add_post("/api/account/pause_all", api_account_pause_all)
     app.router.add_get("/api/accounts/raw", api_get_raw_accounts)
-    app.router.add_post("/api/accounts/raw", api_save_raw_accounts)
-    app.router.add_post("/api/accounts/json/upsert", api_accounts_json_upsert)
-    app.router.add_post("/api/accounts/json/delete", api_accounts_json_delete)
     app.router.add_post("/api/logs/clear", api_logs_clear)
     app.router.add_get("/api/progress", api_progress)
     runner = aiohttp.web.AppRunner(app)
